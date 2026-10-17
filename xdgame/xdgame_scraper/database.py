@@ -95,6 +95,7 @@ class DetailSelection:
     limit: int
     max_attempts: int
     recheck_days: int
+    priority_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -264,15 +265,40 @@ def upsert_list_games(
     )
 
 
+def existing_game_urls(
+    connection: sqlite3.Connection,
+    detail_urls: list[str],
+) -> set[str]:
+    if not detail_urls:
+        return set()
+    placeholders = ", ".join("?" for _ in detail_urls)
+    rows = connection.execute(
+        f"SELECT detail_url FROM games WHERE detail_url IN ({placeholders})",
+        detail_urls,
+    ).fetchall()
+    return {str(row["detail_url"]) for row in rows}
+
+
 def load_detail_candidates(
     connection: sqlite3.Connection,
     selection: DetailSelection,
 ) -> list[DetailCandidate]:
+    query, parameters = detail_selection_query(selection)
+    rows = connection.execute(query, parameters).fetchall()
+    return [detail_candidate_from_row(row) for row in rows]
+
+
+def detail_selection_query(selection: DetailSelection) -> tuple[str, tuple[Any, ...]]:
     recheck_before = (
         datetime.now().astimezone() - timedelta(days=selection.recheck_days)
     ).isoformat(timespec="seconds")
-    rows = connection.execute(
-        """
+    priority_urls = selection.priority_urls[: selection.limit]
+    priority_order = ""
+    if priority_urls:
+        # 日常新增地址只需覆盖本批上限，避免大量 URL 占满 SQLite 绑定参数。
+        placeholders = ", ".join("?" for _ in priority_urls)
+        priority_order = f"CASE WHEN detail_url IN ({placeholders}) THEN 0 ELSE 1 END,"
+    query = f"""
         SELECT id, name, detail_url, quark_url, detail_status, detail_attempts
         FROM games
         WHERE (
@@ -286,31 +312,35 @@ def load_detail_candidates(
             AND detail_updated_at <= ?
         )
         ORDER BY
-            CASE WHEN detail_status IN ('pending', 'retry', 'login_expired') THEN 0
-                 WHEN detail_status = 'recheck_retry' THEN 1
+            {priority_order}
+            CASE WHEN detail_status IN ('retry', 'login_expired', 'recheck_retry') THEN 0
+                 WHEN detail_status = 'pending' THEN 1
                  ELSE 2 END,
+            -- 新入库的 pending 记录优先，防止日常新增长期排在全量历史积压之后。
+            CASE WHEN detail_status = 'pending' THEN id END DESC,
             COALESCE(detail_updated_at, first_seen_at),
             id
         LIMIT ?
-        """,
-        (
-            selection.max_attempts,
-            recheck_before,
-            recheck_before,
-            selection.limit,
-        ),
-    ).fetchall()
-    return [
-        DetailCandidate(
-            id=int(row["id"]),
-            name=str(row["name"]),
-            detail_url=str(row["detail_url"]),
-            quark_url=row["quark_url"],
-            detail_status=str(row["detail_status"]),
-            detail_attempts=int(row["detail_attempts"]),
-        )
-        for row in rows
-    ]
+    """
+    parameters: tuple[Any, ...] = (
+        selection.max_attempts,
+        recheck_before,
+        recheck_before,
+        *priority_urls,
+        selection.limit,
+    )
+    return query, parameters
+
+
+def detail_candidate_from_row(row: sqlite3.Row) -> DetailCandidate:
+    return DetailCandidate(
+        id=int(row["id"]),
+        name=str(row["name"]),
+        detail_url=str(row["detail_url"]),
+        quark_url=row["quark_url"],
+        detail_status=str(row["detail_status"]),
+        detail_attempts=int(row["detail_attempts"]),
+    )
 
 
 def save_detail_result(

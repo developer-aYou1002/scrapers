@@ -4,7 +4,7 @@ import argparse
 import json
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,12 @@ from .database import (
     upsert_games,
     upsert_list_games,
 )
+from .daily import (
+    DailyListConfig,
+    DailyListLock,
+    DailyListProgress,
+    crawl_daily_list,
+)
 from .detail_enricher import (
     DetailResolver,
     EnrichConfig,
@@ -54,9 +60,12 @@ DEFAULT_DATABASE = PROJECT_DIR / "data/xdgame.db"
 DEFAULT_DELAY_MIN = 2.0
 DEFAULT_DELAY_MAX = 4.0
 DEFAULT_MAX_PAGES = 1000
+DEFAULT_DAILY_MAX_PAGES = 10
+DEFAULT_EXISTING_PAGE_LIMIT = 3
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RECHECK_DAYS = 30
+DETAIL_TASK_KEY = "detail-enrichment"
 
 
 @dataclass
@@ -81,6 +90,22 @@ class EnrichBatch:
     candidates: list[DetailCandidate]
     config: EnrichConfig
     lock_owner: str
+    task_key: str
+
+
+@dataclass
+class DailyProgress:
+    list_progress: DailyListProgress
+    detail_progress: EnrichProgress
+
+
+@dataclass(frozen=True)
+class DailyRuntime:
+    list_config: DailyListConfig
+    enrich_config: EnrichConfig
+    selection: DetailSelection
+    list_lock: DailyListLock
+    detail_lock: DailyListLock
 
 
 class FullListLimitReached(RuntimeError):
@@ -100,11 +125,11 @@ def save_json(games: list[dict[str, Any]], source_url: str, output: Path) -> Non
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="抓取 XDGAME 今日更新或电脑游戏全量列表")
+    parser = argparse.ArgumentParser(description="抓取并增量维护 XDGAME 游戏数据")
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("today", "login", "full-list", "enrich"),
+        choices=("today", "login", "full-list", "enrich", "daily"),
         default="today",
     )
     add_list_arguments(parser)
@@ -119,8 +144,14 @@ def add_list_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=DEFAULT_MAX_PAGES,
-        help="全量列表安全页数上限",
+        default=None,
+        help="列表扫描页数上限（full-list 默认 1000，daily 默认 10）",
+    )
+    parser.add_argument(
+        "--existing-page-limit",
+        type=int,
+        default=DEFAULT_EXISTING_PAGE_LIMIT,
+        help="日常扫描连续无新增页面停止阈值",
     )
     parser.add_argument(
         "--restart",
@@ -176,16 +207,37 @@ def build_scrape_config(args: argparse.Namespace) -> ScrapeConfig:
 
 
 def build_full_list_config(args: argparse.Namespace) -> FullListConfig:
-    if args.max_pages <= 0:
-        raise ValueError("max-pages 必须大于 0")
+    max_pages = resolve_max_pages(args.max_pages, DEFAULT_MAX_PAGES)
     validate_delay_range(args)
     return FullListConfig(
         url=args.list_url,
         timeout=args.timeout,
-        max_pages=args.max_pages,
+        max_pages=max_pages,
         delay_min=args.delay_min,
         delay_max=args.delay_max,
     )
+
+
+def build_daily_list_config(args: argparse.Namespace) -> DailyListConfig:
+    max_pages = resolve_max_pages(args.max_pages, DEFAULT_DAILY_MAX_PAGES)
+    if args.existing_page_limit <= 0:
+        raise ValueError("existing-page-limit 必须大于 0")
+    validate_delay_range(args)
+    return DailyListConfig(
+        url=args.list_url,
+        timeout=args.timeout,
+        max_pages=max_pages,
+        existing_page_limit=args.existing_page_limit,
+        delay_min=args.delay_min,
+        delay_max=args.delay_max,
+    )
+
+
+def resolve_max_pages(value: int | None, default: int) -> int:
+    result = default if value is None else value
+    if result <= 0:
+        raise ValueError("max-pages 必须大于 0")
+    return result
 
 
 def build_enrich_config(args: argparse.Namespace) -> EnrichConfig:
@@ -207,14 +259,22 @@ def validate_delay_range(args: argparse.Namespace) -> None:
         raise ValueError("请求间隔必须满足 0 <= delay-min <= delay-max")
 
 
-def build_detail_selection(args: argparse.Namespace) -> DetailSelection:
+def build_detail_selection(
+    args: argparse.Namespace,
+    priority_urls: tuple[str, ...] = (),
+) -> DetailSelection:
     if args.batch_size <= 0:
         raise ValueError("batch-size 必须大于 0")
     if args.max_attempts <= 0:
         raise ValueError("max-attempts 必须大于 0")
     if args.recheck_days <= 0:
         raise ValueError("recheck-days 必须大于 0")
-    return DetailSelection(args.batch_size, args.max_attempts, args.recheck_days)
+    return DetailSelection(
+        args.batch_size,
+        args.max_attempts,
+        args.recheck_days,
+        priority_urls,
+    )
 
 
 def record_run_outcome(
@@ -354,7 +414,7 @@ def enrich_candidates(
             )
             with connection:
                 save_detail_result(connection, candidate.id, update)
-                refresh_crawl_lock(connection, "enrich", batch.lock_owner)
+                refresh_crawl_lock(connection, batch.task_key, batch.lock_owner)
             progress.processed += 1
             if update.detail_status == "complete":
                 progress.completed += 1
@@ -362,7 +422,7 @@ def enrich_candidates(
                 progress.errors += 1
             print(f"详情状态：{update.detail_status}；夸克状态：{update.quark_status}")
             if update.detail_status == "login_expired":
-                raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行 enrich")
+                raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行当前任务")
             wait_between_candidates(batch.config, index, len(batch.candidates))
     return progress
 
@@ -371,13 +431,13 @@ def run_enrich(args: argparse.Namespace) -> EnrichProgress:
     config = build_enrich_config(args)
     selection = build_detail_selection(args)
     with database_connection(args.database) as connection:
-        with crawl_task_lock(connection, "enrich") as lock_owner:
+        with crawl_task_lock(connection, DETAIL_TASK_KEY) as lock_owner:
             candidates = load_detail_candidates(connection, selection)
             progress = EnrichProgress(selected=len(candidates))
             with connection:
                 run_id = start_crawl_run(connection, "enrich")
             try:
-                batch = EnrichBatch(candidates, config, lock_owner)
+                batch = EnrichBatch(candidates, config, lock_owner, DETAIL_TASK_KEY)
                 progress = enrich_candidates(connection, batch, progress)
                 status = "success" if progress.errors == 0 else "completed_with_errors"
                 with connection:
@@ -395,6 +455,93 @@ def run_enrich(args: argparse.Namespace) -> EnrichProgress:
                 record_run_outcome(connection, run_id, outcome)
                 raise
     return progress
+
+
+def execute_daily(
+    connection: sqlite3.Connection,
+    runtime: DailyRuntime,
+    progress: DailyProgress,
+) -> None:
+    progress.list_progress = crawl_daily_list(
+        connection,
+        runtime.list_config,
+        runtime.list_lock,
+    )
+    priority_urls = tuple(progress.list_progress.new_urls)
+    selection = replace(runtime.selection, priority_urls=priority_urls)
+    candidates = load_detail_candidates(connection, selection)
+    progress.detail_progress = EnrichProgress(selected=len(candidates))
+    batch = EnrichBatch(
+        candidates,
+        runtime.enrich_config,
+        runtime.detail_lock.owner,
+        runtime.detail_lock.task_key,
+    )
+    enrich_candidates(connection, batch, progress.detail_progress)
+
+
+def daily_outcome(progress: DailyProgress) -> CrawlRunOutcome:
+    processed = daily_processed_count(progress)
+    if progress.list_progress.incomplete:
+        return CrawlRunOutcome("incomplete", processed, progress.list_progress.stop_reason)
+    if progress.detail_progress.errors:
+        summary = f"详情补全存在 {progress.detail_progress.errors} 条非成功状态"
+        return CrawlRunOutcome("completed_with_errors", processed, summary)
+    return CrawlRunOutcome("success", processed)
+
+
+def daily_processed_count(progress: DailyProgress) -> int:
+    return progress.list_progress.games + progress.detail_progress.processed
+
+
+def run_daily(args: argparse.Namespace) -> DailyProgress:
+    list_config = build_daily_list_config(args)
+    enrich_config = build_enrich_config(args)
+    selection = build_detail_selection(args)
+    progress = DailyProgress(DailyListProgress(), EnrichProgress(0))
+    list_task_key = f"full-list:{list_config.url}"
+    with database_connection(args.database) as connection:
+        # 固定按“列表锁、详情锁”顺序持有，既避免与独立任务重叠，也不会形成交叉等待。
+        with crawl_task_lock(connection, list_task_key) as list_owner:
+            with crawl_task_lock(connection, DETAIL_TASK_KEY) as detail_owner:
+                runtime = DailyRuntime(
+                    list_config,
+                    enrich_config,
+                    selection,
+                    DailyListLock(list_task_key, list_owner),
+                    DailyListLock(DETAIL_TASK_KEY, detail_owner),
+                )
+                run_daily_locked(connection, runtime, progress)
+    return progress
+
+
+def run_daily_locked(
+    connection: sqlite3.Connection,
+    runtime: DailyRuntime,
+    progress: DailyProgress,
+) -> None:
+    with connection:
+        run_id = start_crawl_run(connection, "daily")
+    try:
+        execute_daily(connection, runtime, progress)
+        with connection:
+            finish_crawl_run(connection, run_id, daily_outcome(progress))
+    except KeyboardInterrupt:
+        outcome = CrawlRunOutcome(
+            "incomplete",
+            daily_processed_count(progress),
+            "用户中断日常更新",
+        )
+        record_run_outcome(connection, run_id, outcome)
+        raise RuntimeError("用户中断；已保留逐页和逐条提交的结果") from None
+    except Exception as error:
+        outcome = CrawlRunOutcome(
+            "failed",
+            daily_processed_count(progress),
+            str(error)[:1000],
+        )
+        record_run_outcome(connection, run_id, outcome)
+        raise
 
 
 def main() -> int:
@@ -420,6 +567,10 @@ def main() -> int:
             )
             print(f"数据库已更新：{args.database}")
             return 0
+        if args.command == "daily":
+            progress = run_daily(args)
+            print_daily_summary(progress, args.database)
+            return 1 if progress.list_progress.incomplete else 0
         games = run_scrape(args)
     except (requests.RequestException, sqlite3.Error, RuntimeError, ValueError, OSError) as error:
         print(f"执行失败：{error}", file=sys.stderr)
@@ -430,3 +581,17 @@ def main() -> int:
     print(f"结果已保存至：{args.output}")
     print(f"数据库已更新：{args.database}")
     return 0
+
+
+def print_daily_summary(progress: DailyProgress, database: Path) -> None:
+    listing = progress.list_progress
+    details = progress.detail_progress
+    print(
+        f"日常更新完成：扫描 {listing.pages} 页、{listing.games} 条，"
+        f"新增 {listing.new_games} 条；详情处理 {details.processed} 条，"
+        f"成功 {details.completed} 条，其他状态 {details.errors} 条。"
+    )
+    print(f"停止原因：{listing.stop_reason}")
+    if listing.incomplete:
+        print("日常扫描尚未安全收敛，请扩大 --max-pages 后重新运行。", file=sys.stderr)
+    print(f"数据库已更新：{database}")

@@ -4,7 +4,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -27,6 +27,11 @@ class FullListConfig:
 class ListPage:
     games: list[dict[str, Any]]
     next_url: str | None
+
+
+class DelayConfig(Protocol):
+    delay_min: float
+    delay_max: float
 
 
 def element_text(item: Any, selector: str) -> str | None:
@@ -112,7 +117,7 @@ def fetch_list_page(
     return parse_list_page(response.content, response.url)
 
 
-def wait_for_next_page(config: FullListConfig) -> None:
+def wait_for_next_page(config: DelayConfig) -> None:
     delay = random.uniform(config.delay_min, config.delay_max)
     print(f"等待 {delay:.1f} 秒后抓取下一页。")
     time.sleep(delay)

@@ -7,6 +7,7 @@
 - 使用 `requests + BeautifulSoup` 抓取今日更新列表和详情页。
 - 支持逐页抓取电脑游戏分类全量列表，每页成功后原子写入 SQLite 并保存断点。
 - 支持按批次补全详情，每条结果独立提交，任务中断后可从剩余记录继续。
+- 支持日常增量扫描，更新已有列表元数据，并优先补全当天新增记录。
 - 详情页没有公开夸克地址时，使用 Playwright 执行 JavaScript 并点击“夸克网盘”。
 - 使用 Python 内置 SQLite 保存游戏、运行记录和后续断点续跑所需的 checkpoint。
 - 支持保存本人账号的合法登录状态，不会把账号密码写入代码或结果文件。
@@ -19,6 +20,7 @@
 - `xdgame_scraper/crawler.py`：HTTP/Playwright 抓取、页面解析和请求节流。
 - `xdgame_scraper/list_crawler.py`：电脑游戏列表页解析、分页识别和列表请求节流。
 - `xdgame_scraper/detail_enricher.py`：详情分批补全、浏览器回退、状态分类与请求节流。
+- `xdgame_scraper/daily.py`：日常列表扫描、新增识别和安全停止判断。
 - `xdgame_scraper/database.py`：SQLite 初始化、迁移、事务及数据访问。
 - `xdgame_scraper/login.py`：登录表单填写、人工验证回退和登录状态保存。
 - `xdgame_scraper/__main__.py`：支持模块方式启动。
@@ -177,6 +179,26 @@ python scraper.py enrich --recheck-days 30
 ```
 
 同一数据库同一时间只允许一个 `enrich` 任务运行。浏览器回退需要有效的 `login_state.json`；登录失效后执行 `python scraper.py login` 更新状态。
+
+### 日常增量更新
+
+日常任务先扫描最近的电脑游戏列表，再对当天新增、可重试、待处理或到期复查的记录执行一批详情补全：
+
+```powershell
+python scraper.py daily
+```
+
+默认最多扫描 10 页。连续 3 个完整页面没有发现新游戏时提前停止；这些页面中的已有记录仍会更新名称、评分、容量、封面、站点日期和 `last_seen_at`。当天新增记录优先进入默认 20 条详情补全批次，其余待处理记录会在后续运行中继续处理。
+
+可以覆盖列表停止条件和详情批量大小：
+
+```powershell
+python scraper.py daily --max-pages 20 --existing-page-limit 5 --batch-size 30
+```
+
+如果到达页数上限时最后一页仍发现新游戏，已扫描页面和已处理详情会保留，`crawl_runs` 状态记录为 `incomplete`，命令返回退出码 `1`。扩大 `--max-pages` 后重新运行即可。连续无新增提前停止、到达列表末页，或到达上限时最后一页已经无新增，退出码为 `0`；登录失效、网络或数据库错误同样返回 `1`。
+
+`daily` 与独立 `enrich` 共用详情任务锁，并与相同列表入口的 `full-list` 共用列表任务锁，避免两个进程重复补全或同时扫描同一列表。
 
 ## SQLite 数据库
 
@@ -376,6 +398,35 @@ db.close()
 
 预期单次最多处理 2 条，成功记录为 `complete`、尝试次数归零且写入 `quark_checked_at`。临时失败会累计尝试次数；重新执行命令只选择剩余待处理或允许重试的记录。登录失效时退出码为 `1`，已处理记录仍保留。
 
+### 验证日常增量更新
+
+使用已完成列表入库的验证数据库，以较小参数观察提前停止：
+
+```powershell
+python scraper.py daily --database data\verify.db --max-pages 5 --existing-page-limit 2 --batch-size 2 --show-browser
+$LASTEXITCODE
+```
+
+如果连续 2 页没有新增，应提前停止且退出码为 `0`。随后检查最近运行记录：
+
+```powershell
+@'
+import sqlite3
+
+db = sqlite3.connect("data/verify.db")
+print(db.execute("""
+    SELECT run_type, status, processed_count, error_summary
+    FROM crawl_runs
+    WHERE run_type = 'daily'
+    ORDER BY id DESC
+    LIMIT 1
+""").fetchone())
+db.close()
+'@ | python -
+```
+
+在仍持续出现新增数据时将 `--max-pages` 设为 `1`，预期退出码为 `1`，最新运行状态为 `incomplete`，已经扫描的列表记录不会回滚。
+
 ### 正式执行
 
 保存登录状态：
@@ -400,6 +451,12 @@ python scraper.py full-list
 
 ```powershell
 python scraper.py enrich
+```
+
+执行日常增量更新：
+
+```powershell
+python scraper.py daily
 ```
 
 查看正式数据库的最近运行记录时，把上述验证命令中的 `data/verify.db` 替换为 `data/xdgame.db`。
