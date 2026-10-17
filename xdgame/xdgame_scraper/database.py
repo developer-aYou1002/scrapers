@@ -6,12 +6,12 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 
-DATABASE_VERSION = 3
+DATABASE_VERSION = 4
 LOCK_STALE_SECONDS = 30 * 60
 DATABASE_MIGRATIONS = {
     1: (
@@ -70,6 +70,10 @@ DATABASE_MIGRATIONS = {
         )
         """,
     ),
+    4: (
+        "ALTER TABLE games ADD COLUMN quark_checked_at TEXT",
+        "CREATE INDEX idx_games_quark_checked_at ON games(quark_checked_at)",
+    ),
 }
 
 
@@ -84,6 +88,33 @@ class CrawlRunOutcome:
     status: str
     processed_count: int
     error_summary: str | None = None
+
+
+@dataclass(frozen=True)
+class DetailSelection:
+    limit: int
+    max_attempts: int
+    recheck_days: int
+
+
+@dataclass(frozen=True)
+class DetailCandidate:
+    id: int
+    name: str
+    detail_url: str
+    quark_url: str | None
+    detail_status: str
+    detail_attempts: int
+
+
+@dataclass(frozen=True)
+class DetailUpdate:
+    quark_url: str | None
+    quark_status: str
+    detail_status: str
+    detail_attempts: int
+    last_error: str | None
+    checked_at: str | None
 
 
 def now_iso() -> str:
@@ -142,6 +173,7 @@ def game_record(game: dict[str, Any], category: str | None, timestamp: str) -> t
         timestamp,
         timestamp,
         timestamp,
+        timestamp if quark_url else None,
     )
 
 
@@ -158,8 +190,8 @@ def upsert_games(
         INSERT INTO games (
             name, detail_url, category, quark_url, quark_status, detail_status,
             detail_attempts, last_error, first_seen_at, last_seen_at,
-            detail_updated_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            detail_updated_at, updated_at, quark_checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(detail_url) DO UPDATE SET
             name = excluded.name,
             category = COALESCE(excluded.category, games.category),
@@ -179,7 +211,9 @@ def upsert_games(
                 THEN excluded.last_error ELSE NULL END,
             last_seen_at = excluded.last_seen_at,
             detail_updated_at = excluded.detail_updated_at,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            quark_checked_at = CASE WHEN excluded.quark_url IS NOT NULL
+                THEN excluded.quark_checked_at ELSE games.quark_checked_at END
         """,
         records,
     )
@@ -227,6 +261,88 @@ def upsert_list_games(
             updated_at = excluded.updated_at
         """,
         records,
+    )
+
+
+def load_detail_candidates(
+    connection: sqlite3.Connection,
+    selection: DetailSelection,
+) -> list[DetailCandidate]:
+    recheck_before = (
+        datetime.now().astimezone() - timedelta(days=selection.recheck_days)
+    ).isoformat(timespec="seconds")
+    rows = connection.execute(
+        """
+        SELECT id, name, detail_url, quark_url, detail_status, detail_attempts
+        FROM games
+        WHERE (
+            detail_status IN ('pending', 'retry', 'recheck_retry', 'login_expired')
+            AND detail_attempts < ?
+        ) OR (
+            detail_status = 'complete'
+            AND COALESCE(quark_checked_at, detail_updated_at, first_seen_at) <= ?
+        ) OR (
+            detail_status = 'recheck_failed'
+            AND detail_updated_at <= ?
+        )
+        ORDER BY
+            CASE WHEN detail_status IN ('pending', 'retry', 'login_expired') THEN 0
+                 WHEN detail_status = 'recheck_retry' THEN 1
+                 ELSE 2 END,
+            COALESCE(detail_updated_at, first_seen_at),
+            id
+        LIMIT ?
+        """,
+        (
+            selection.max_attempts,
+            recheck_before,
+            recheck_before,
+            selection.limit,
+        ),
+    ).fetchall()
+    return [
+        DetailCandidate(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            detail_url=str(row["detail_url"]),
+            quark_url=row["quark_url"],
+            detail_status=str(row["detail_status"]),
+            detail_attempts=int(row["detail_attempts"]),
+        )
+        for row in rows
+    ]
+
+
+def save_detail_result(
+    connection: sqlite3.Connection,
+    game_id: int,
+    update: DetailUpdate,
+) -> None:
+    timestamp = now_iso()
+    connection.execute(
+        """
+        UPDATE games
+        SET quark_url = ?,
+            quark_status = ?,
+            detail_status = ?,
+            detail_attempts = ?,
+            last_error = ?,
+            quark_checked_at = COALESCE(?, quark_checked_at),
+            detail_updated_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            update.quark_url,
+            update.quark_status,
+            update.detail_status,
+            update.detail_attempts,
+            update.last_error,
+            update.checked_at,
+            timestamp,
+            timestamp,
+            game_id,
+        ),
     )
 
 
@@ -288,7 +404,7 @@ def crawl_task_lock(
             (task_key, owner, acquired_at, acquired_at, stale_before),
         )
     if cursor.rowcount != 1:
-        raise RuntimeError("相同的全量列表任务正在运行，请勿重复启动")
+        raise RuntimeError("相同任务正在运行，请勿重复启动")
     try:
         yield owner
     finally:
@@ -313,7 +429,7 @@ def refresh_crawl_lock(
         (time.time(), task_key, owner),
     )
     if cursor.rowcount != 1:
-        raise RuntimeError("全量列表任务锁已失效，已停止写入")
+        raise RuntimeError("任务锁已失效，已停止写入")
 
 
 def start_crawl_run(connection: sqlite3.Connection, run_type: str) -> int:

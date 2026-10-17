@@ -14,17 +14,28 @@ from .crawler import DEFAULT_URL, ScrapeConfig, create_session, scrape
 from .database import (
     CrawlCheckpoint,
     CrawlRunOutcome,
+    DetailCandidate,
+    DetailSelection,
     crawl_task_lock,
     database_connection,
     delete_checkpoint,
     finish_crawl_run,
+    load_detail_candidates,
     load_checkpoint,
     now_iso,
     refresh_crawl_lock,
+    save_detail_result,
     save_checkpoint,
     start_crawl_run,
     upsert_games,
     upsert_list_games,
+)
+from .detail_enricher import (
+    DetailResolver,
+    EnrichConfig,
+    LoginStateExpired,
+    build_detail_update,
+    wait_between_candidates,
 )
 from .list_crawler import (
     DEFAULT_LIST_URL,
@@ -43,6 +54,9 @@ DEFAULT_DATABASE = PROJECT_DIR / "data/xdgame.db"
 DEFAULT_DELAY_MIN = 2.0
 DEFAULT_DELAY_MAX = 4.0
 DEFAULT_MAX_PAGES = 1000
+DEFAULT_BATCH_SIZE = 20
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_RECHECK_DAYS = 30
 
 
 @dataclass
@@ -52,6 +66,21 @@ class FullListProgress:
     current_url: str | None
     pages: int = 0
     games: int = 0
+
+
+@dataclass
+class EnrichProgress:
+    selected: int
+    processed: int = 0
+    completed: int = 0
+    errors: int = 0
+
+
+@dataclass(frozen=True)
+class EnrichBatch:
+    candidates: list[DetailCandidate]
+    config: EnrichConfig
+    lock_owner: str
 
 
 class FullListLimitReached(RuntimeError):
@@ -75,9 +104,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("today", "login", "full-list"),
+        choices=("today", "login", "full-list", "enrich"),
         default="today",
     )
+    add_list_arguments(parser)
+    add_enrich_arguments(parser)
+    add_common_arguments(parser)
+    return parser.parse_args()
+
+
+def add_list_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--url", default=DEFAULT_URL, help="目标首页 URL")
     parser.add_argument("--list-url", default=DEFAULT_LIST_URL, help="电脑游戏列表入口 URL")
     parser.add_argument(
@@ -91,6 +127,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="忽略全量列表断点并从第一页重新扫描",
     )
+
+
+def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="详情补全单批处理数量",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help="单条详情最大失败尝试次数",
+    )
+    parser.add_argument(
+        "--recheck-days",
+        type=int,
+        default=DEFAULT_RECHECK_DAYS,
+        help="已成功夸克地址的复查周期天数",
+    )
+
+
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE, help="SQLite 数据库路径")
     parser.add_argument("--timeout", type=float, default=20, help="请求超时秒数")
@@ -101,12 +161,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-browser", action="store_true", help="抓取时显示浏览器")
     parser.add_argument("--delay-min", type=float, default=DEFAULT_DELAY_MIN, help="请求最小间隔秒数")
     parser.add_argument("--delay-max", type=float, default=DEFAULT_DELAY_MAX, help="请求最大间隔秒数")
-    return parser.parse_args()
 
 
 def build_scrape_config(args: argparse.Namespace) -> ScrapeConfig:
-    if args.delay_min < 0 or args.delay_max < args.delay_min:
-        raise ValueError("请求间隔必须满足 0 <= delay-min <= delay-max")
+    validate_delay_range(args)
     return ScrapeConfig(
         url=args.url,
         timeout=args.timeout,
@@ -120,8 +178,7 @@ def build_scrape_config(args: argparse.Namespace) -> ScrapeConfig:
 def build_full_list_config(args: argparse.Namespace) -> FullListConfig:
     if args.max_pages <= 0:
         raise ValueError("max-pages 必须大于 0")
-    if args.delay_min < 0 or args.delay_max < args.delay_min:
-        raise ValueError("请求间隔必须满足 0 <= delay-min <= delay-max")
+    validate_delay_range(args)
     return FullListConfig(
         url=args.list_url,
         timeout=args.timeout,
@@ -129,6 +186,35 @@ def build_full_list_config(args: argparse.Namespace) -> FullListConfig:
         delay_min=args.delay_min,
         delay_max=args.delay_max,
     )
+
+
+def build_enrich_config(args: argparse.Namespace) -> EnrichConfig:
+    if args.timeout <= 0:
+        raise ValueError("timeout 必须大于 0")
+    validate_delay_range(args)
+    return EnrichConfig(
+        timeout=args.timeout,
+        login_state=args.login_state,
+        headless=not args.show_browser,
+        delay_min=args.delay_min,
+        delay_max=args.delay_max,
+        max_attempts=args.max_attempts,
+    )
+
+
+def validate_delay_range(args: argparse.Namespace) -> None:
+    if args.delay_min < 0 or args.delay_max < args.delay_min:
+        raise ValueError("请求间隔必须满足 0 <= delay-min <= delay-max")
+
+
+def build_detail_selection(args: argparse.Namespace) -> DetailSelection:
+    if args.batch_size <= 0:
+        raise ValueError("batch-size 必须大于 0")
+    if args.max_attempts <= 0:
+        raise ValueError("max-attempts 必须大于 0")
+    if args.recheck_days <= 0:
+        raise ValueError("recheck-days 必须大于 0")
+    return DetailSelection(args.batch_size, args.max_attempts, args.recheck_days)
 
 
 def record_run_outcome(
@@ -252,6 +338,65 @@ def run_full_list(args: argparse.Namespace) -> FullListProgress:
     return progress
 
 
+def enrich_candidates(
+    connection: sqlite3.Connection,
+    batch: EnrichBatch,
+    progress: EnrichProgress,
+) -> EnrichProgress:
+    with DetailResolver(batch.config) as resolver:
+        for index, candidate in enumerate(batch.candidates, start=1):
+            print(f"[{index}/{len(batch.candidates)}] 补全详情：{candidate.name}")
+            resolution = resolver.resolve(candidate)
+            update = build_detail_update(
+                candidate,
+                resolution,
+                batch.config.max_attempts,
+            )
+            with connection:
+                save_detail_result(connection, candidate.id, update)
+                refresh_crawl_lock(connection, "enrich", batch.lock_owner)
+            progress.processed += 1
+            if update.detail_status == "complete":
+                progress.completed += 1
+            else:
+                progress.errors += 1
+            print(f"详情状态：{update.detail_status}；夸克状态：{update.quark_status}")
+            if update.detail_status == "login_expired":
+                raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行 enrich")
+            wait_between_candidates(batch.config, index, len(batch.candidates))
+    return progress
+
+
+def run_enrich(args: argparse.Namespace) -> EnrichProgress:
+    config = build_enrich_config(args)
+    selection = build_detail_selection(args)
+    with database_connection(args.database) as connection:
+        with crawl_task_lock(connection, "enrich") as lock_owner:
+            candidates = load_detail_candidates(connection, selection)
+            progress = EnrichProgress(selected=len(candidates))
+            with connection:
+                run_id = start_crawl_run(connection, "enrich")
+            try:
+                batch = EnrichBatch(candidates, config, lock_owner)
+                progress = enrich_candidates(connection, batch, progress)
+                status = "success" if progress.errors == 0 else "completed_with_errors"
+                with connection:
+                    finish_crawl_run(
+                        connection,
+                        run_id,
+                        CrawlRunOutcome(status, progress.processed),
+                    )
+            except KeyboardInterrupt:
+                outcome = CrawlRunOutcome("incomplete", progress.processed, "用户中断详情补全")
+                record_run_outcome(connection, run_id, outcome)
+                raise RuntimeError("用户中断；已保留逐条提交的详情结果") from None
+            except Exception as error:
+                outcome = CrawlRunOutcome("failed", progress.processed, str(error)[:1000])
+                record_run_outcome(connection, run_id, outcome)
+                raise
+    return progress
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -263,6 +408,15 @@ def main() -> int:
             print(
                 f"全量列表抓取完成：{progress.pages} 页，"
                 f"共处理 {progress.games} 条记录。"
+            )
+            print(f"数据库已更新：{args.database}")
+            return 0
+        if args.command == "enrich":
+            progress = run_enrich(args)
+            print(
+                f"详情补全完成：选取 {progress.selected} 条，"
+                f"处理 {progress.processed} 条，成功 {progress.completed} 条，"
+                f"其他状态 {progress.errors} 条。"
             )
             print(f"数据库已更新：{args.database}")
             return 0

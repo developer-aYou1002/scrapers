@@ -1,11 +1,12 @@
 # XDGAME 游戏抓取器
 
-抓取 XDGAME 首页“今日更新”或“电脑游戏”分类全量列表，将结果持久化到 SQLite；今日更新模式还会解析夸克网盘地址并保留 JSON 输出。
+抓取 XDGAME 首页“今日更新”或“电脑游戏”分类全量列表，将结果持久化到 SQLite，并支持分批补全及定期复查夸克网盘地址；今日更新模式还会保留 JSON 输出。
 
 ## 能力与限制
 
 - 使用 `requests + BeautifulSoup` 抓取今日更新列表和详情页。
 - 支持逐页抓取电脑游戏分类全量列表，每页成功后原子写入 SQLite 并保存断点。
+- 支持按批次补全详情，每条结果独立提交，任务中断后可从剩余记录继续。
 - 详情页没有公开夸克地址时，使用 Playwright 执行 JavaScript 并点击“夸克网盘”。
 - 使用 Python 内置 SQLite 保存游戏、运行记录和后续断点续跑所需的 checkpoint。
 - 支持保存本人账号的合法登录状态，不会把账号密码写入代码或结果文件。
@@ -17,6 +18,7 @@
 - `xdgame_scraper/cli.py`：命令行参数、流程编排、JSON 输出和退出码。
 - `xdgame_scraper/crawler.py`：HTTP/Playwright 抓取、页面解析和请求节流。
 - `xdgame_scraper/list_crawler.py`：电脑游戏列表页解析、分页识别和列表请求节流。
+- `xdgame_scraper/detail_enricher.py`：详情分批补全、浏览器回退、状态分类与请求节流。
 - `xdgame_scraper/database.py`：SQLite 初始化、迁移、事务及数据访问。
 - `xdgame_scraper/login.py`：登录表单填写、人工验证回退和登录状态保存。
 - `xdgame_scraper/__main__.py`：支持模块方式启动。
@@ -138,20 +140,54 @@ python scraper.py full-list --list-url https://www.xdgame.com/list/1/ --delay-mi
 
 如果详情地址已经存在，列表 UPSERT 会保留已有详情和夸克解析结果，不会把已成功记录重置为待处理。当前第三阶段的 `full-list` 子命令只负责稳定完成全量列表入库，不会增加详情补全尝试次数。
 
-后续“详情和夸克地址分批补充”阶段会对全量列表中的所有待处理记录进入详情页，并补充夸克网盘地址、夸克解析状态、详情处理状态、详情尝试次数和最后错误。详情补全会采用每批 20 条、单条最多尝试 3 次的策略，并在断点续跑阶段完成后接入，避免数百页列表抓取与上万条详情访问绑定成一个无法恢复的长任务。
+全量列表扫描和详情补全相互独立，避免数百页列表抓取与上万条详情访问绑定成一个无法恢复的长任务。列表入库完成或取得部分数据后，可按下一节分批补全详情。
 
 同一数据库和列表入口同一时间只允许一个全量任务运行。任务锁每页刷新心跳，正常退出时自动释放；进程异常消失且超过30分钟没有心跳时，后续任务可以自动接管旧锁。
+
+### 详情和夸克地址分批补全
+
+默认从数据库稳定选取最多 20 条待处理或可重试记录：
+
+```powershell
+python scraper.py enrich
+```
+
+每条记录先通过 HTTP 查找公开夸克地址；没有解析到地址时，等待随机间隔后使用带登录状态的 Playwright。相邻游戏之间同样随机等待 2～4 秒。每条结果立即写入数据库，因此中断后重新执行相同命令即可继续处理剩余记录。
+
+可以覆盖批量大小、最大尝试次数和请求间隔：
+
+```powershell
+python scraper.py enrich --batch-size 20 --max-attempts 3 --delay-min 2 --delay-max 4
+```
+
+详情状态包括：
+
+- `complete`：成功取得夸克地址。
+- `retry`：临时失败，后续批次继续尝试；累计 3 次后转为 `failed`。
+- `login_expired`：登录状态失效，当前批次立即停止并返回非零退出码；重新执行 `login` 后可继续。
+- `forbidden`：页面明确提示无权限或需要会员。
+- `not_found`：详情页没有夸克网盘入口。
+- `structure_changed`：入口存在但未按预期返回地址，或页面结构异常。
+- `recheck_retry` / `recheck_failed`：已有地址复查失败；原地址会保留，不会因临时故障被清空。
+
+成功地址默认每 30 天进入复查队列。可在临时人工检查时覆盖周期：
+
+```powershell
+python scraper.py enrich --recheck-days 30
+```
+
+同一数据库同一时间只允许一个 `enrich` 任务运行。浏览器回退需要有效的 `login_state.json`；登录失效后执行 `python scraper.py login` 更新状态。
 
 ## SQLite 数据库
 
 抓取时会自动初始化并更新 `data/xdgame.db`，不需要手动建库。数据库结构使用 `PRAGMA user_version` 管理版本，重复运行不会重复建表或清空已有数据。
 
-当前数据库结构版本为 3，包含以下数据：
+当前数据库结构版本为 4，包含以下数据：
 
-- `games`：游戏、详情地址、分类、列表元数据、夸克地址、解析状态、尝试次数及发现时间。
+- `games`：游戏、详情地址、分类、列表元数据、夸克地址、解析状态、尝试次数、最后成功复查时间及发现时间。
 - `crawl_runs`：每次任务的开始、结束、状态、处理数量和错误摘要。
-- `crawl_checkpoints`：为后续列表抓取和详情补全保存断点位置。
-- `crawl_locks`：防止相同全量列表任务并发写入，并支持超时接管异常遗留锁。
+- `crawl_checkpoints`：保存全量列表的分页断点位置。
+- `crawl_locks`：防止相同全量列表或详情补全任务并发写入，并支持超时接管异常遗留锁。
 
 同一详情页地址会执行 UPSERT，不会重复插入。可以通过参数指定其他数据库路径：
 
@@ -194,7 +230,7 @@ with database_connection(path) as db:
 '@ | python -
 ```
 
-预期数据库版本为 `3`，并且下面的命令返回 `True`：
+预期数据库版本为 `4`，并且下面的命令返回 `True`：
 
 ```powershell
 Test-Path .\data\verify.db
@@ -259,7 +295,8 @@ print("当前任务锁：", db.execute(
 
 print("最近写入的游戏：")
 for row in db.execute("""
-    SELECT name, category, score, size_text, source_updated_date
+    SELECT name, category, score, size_text, source_updated_date,
+           detail_status, detail_attempts, quark_checked_at
     FROM games
     ORDER BY id DESC
     LIMIT 5
@@ -281,7 +318,7 @@ db.close()
 
 预期结果：
 
-- 数据库版本为 `3`。
+- 数据库版本为 `4`。
 - 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`、`crawl_locks`。
 - 游戏总数大于 `0`，并与唯一详情地址数相同。
 - 游戏记录包含分类、评分、容量和站点日期等列表元数据。
@@ -307,6 +344,38 @@ python scraper.py full-list --database data\verify.db --max-pages 2 --restart
 
 该命令会先删除当前列表入口的 checkpoint，再从第一页抓取。游戏仍通过 UPSERT 保存，不应产生重复详情地址。
 
+### 验证详情分批补全
+
+先保存有效登录状态，再使用较小批次验证；显示浏览器便于人工观察登录与入口状态：
+
+```powershell
+python scraper.py login
+python scraper.py enrich --database data\verify.db --batch-size 2 --show-browser
+$LASTEXITCODE
+```
+
+检查最近两条详情状态：
+
+```powershell
+@'
+import sqlite3
+
+db = sqlite3.connect("data/verify.db")
+for row in db.execute("""
+    SELECT name, quark_url, quark_status, detail_status,
+           detail_attempts, last_error, quark_checked_at
+    FROM games
+    WHERE detail_updated_at IS NOT NULL
+    ORDER BY detail_updated_at DESC
+    LIMIT 2
+"""):
+    print(row)
+db.close()
+'@ | python -
+```
+
+预期单次最多处理 2 条，成功记录为 `complete`、尝试次数归零且写入 `quark_checked_at`。临时失败会累计尝试次数；重新执行命令只选择剩余待处理或允许重试的记录。登录失效时退出码为 `1`，已处理记录仍保留。
+
 ### 正式执行
 
 保存登录状态：
@@ -325,6 +394,12 @@ python scraper.py today
 
 ```powershell
 python scraper.py full-list
+```
+
+分批补全详情和夸克地址：
+
+```powershell
+python scraper.py enrich
 ```
 
 查看正式数据库的最近运行记录时，把上述验证命令中的 `data/verify.db` 替换为 `data/xdgame.db`。
