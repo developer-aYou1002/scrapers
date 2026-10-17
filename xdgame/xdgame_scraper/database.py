@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-DATABASE_VERSION = 1
+DATABASE_VERSION = 2
 DATABASE_MIGRATIONS = {
     1: (
         """
@@ -50,6 +50,12 @@ DATABASE_MIGRATIONS = {
         )
         """,
         "CREATE INDEX idx_crawl_runs_started_at ON crawl_runs(started_at)",
+    ),
+    2: (
+        "ALTER TABLE games ADD COLUMN score TEXT",
+        "ALTER TABLE games ADD COLUMN size_text TEXT",
+        "ALTER TABLE games ADD COLUMN source_updated_date TEXT",
+        "ALTER TABLE games ADD COLUMN cover_url TEXT",
     ),
 }
 
@@ -160,6 +166,51 @@ def upsert_games(
                 THEN excluded.last_error ELSE NULL END,
             last_seen_at = excluded.last_seen_at,
             detail_updated_at = excluded.detail_updated_at,
+            updated_at = excluded.updated_at
+        """,
+        records,
+    )
+
+
+def list_game_record(game: dict[str, Any], timestamp: str) -> tuple[Any, ...]:
+    return (
+        game["name"],
+        game["url"],
+        game.get("category"),
+        game.get("score"),
+        game.get("size"),
+        game.get("source_updated_date"),
+        game.get("cover_url"),
+        timestamp,
+        timestamp,
+        timestamp,
+    )
+
+
+def upsert_list_games(
+    connection: sqlite3.Connection,
+    games: list[dict[str, Any]],
+) -> None:
+    timestamp = now_iso()
+    records = [list_game_record(game, timestamp) for game in games]
+    # 列表扫描只更新发现信息，不计入详情尝试次数，也不覆盖已取得的夸克地址。
+    connection.executemany(
+        """
+        INSERT INTO games (
+            name, detail_url, category, score, size_text, source_updated_date,
+            cover_url, quark_url, quark_status, detail_status, detail_attempts,
+            last_error, first_seen_at, last_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '待解析', 'pending', 0, NULL, ?, ?, ?)
+        ON CONFLICT(detail_url) DO UPDATE SET
+            name = excluded.name,
+            category = COALESCE(excluded.category, games.category),
+            score = COALESCE(excluded.score, games.score),
+            size_text = COALESCE(excluded.size_text, games.size_text),
+            source_updated_date = COALESCE(
+                excluded.source_updated_date, games.source_updated_date
+            ),
+            cover_url = COALESCE(excluded.cover_url, games.cover_url),
+            last_seen_at = excluded.last_seen_at,
             updated_at = excluded.updated_at
         """,
         records,
