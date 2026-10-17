@@ -5,7 +5,7 @@
 ## 能力与限制
 
 - 使用 `requests + BeautifulSoup` 抓取今日更新列表和详情页。
-- 支持逐页抓取电脑游戏分类全量列表，每页成功后立即写入 SQLite。
+- 支持逐页抓取电脑游戏分类全量列表，每页成功后原子写入 SQLite 并保存断点。
 - 详情页没有公开夸克地址时，使用 Playwright 执行 JavaScript 并点击“夸克网盘”。
 - 使用 Python 内置 SQLite 保存游戏、运行记录和后续断点续跑所需的 checkpoint。
 - 支持保存本人账号的合法登录状态，不会把账号密码写入代码或结果文件。
@@ -104,13 +104,25 @@ python scraper.py full-list
 
 默认入口为 `https://www.xdgame.com/list/1/`，默认最多抓取 1000 页，并在相邻页面请求之间随机等待 2～4 秒。当前站点页数较多，完整运行可能需要较长时间。
 
+每页的游戏数据、下一页地址和最后一条游戏地址在同一事务中提交。任务中断后再次执行相同命令，会自动从最近成功页面的下一页继续：
+
+```powershell
+python scraper.py full-list
+```
+
+如果 checkpoint 已经标记为完成，命令不会重复扫描。需要从第一页重新检查时使用：
+
+```powershell
+python scraper.py full-list --restart
+```
+
 可在人工验证时限制页数，例如只抓取前两页：
 
 ```powershell
 python scraper.py full-list --max-pages 2
 ```
 
-如果达到上限时网站仍有下一页，程序会以非零状态退出并明确提示“全量抓取尚未结束”；已经成功写入的页面不会回滚。也可以覆盖列表入口或请求间隔：
+如果达到上限时网站仍有下一页，程序会以非零状态退出并明确提示“全量抓取尚未结束”；已经成功写入的页面和下一页断点不会回滚。再次执行会从断点继续。也可以覆盖列表入口或请求间隔：
 
 ```powershell
 python scraper.py full-list --list-url https://www.xdgame.com/list/1/ --delay-min 3 --delay-max 6
@@ -128,15 +140,18 @@ python scraper.py full-list --list-url https://www.xdgame.com/list/1/ --delay-mi
 
 后续“详情和夸克地址分批补充”阶段会对全量列表中的所有待处理记录进入详情页，并补充夸克网盘地址、夸克解析状态、详情处理状态、详情尝试次数和最后错误。详情补全会采用每批 20 条、单条最多尝试 3 次的策略，并在断点续跑阶段完成后接入，避免数百页列表抓取与上万条详情访问绑定成一个无法恢复的长任务。
 
+同一数据库和列表入口同一时间只允许一个全量任务运行。任务锁每页刷新心跳，正常退出时自动释放；进程异常消失且超过30分钟没有心跳时，后续任务可以自动接管旧锁。
+
 ## SQLite 数据库
 
 抓取时会自动初始化并更新 `data/xdgame.db`，不需要手动建库。数据库结构使用 `PRAGMA user_version` 管理版本，重复运行不会重复建表或清空已有数据。
 
-当前数据库结构版本为 2，包含三类数据：
+当前数据库结构版本为 3，包含以下数据：
 
 - `games`：游戏、详情地址、分类、列表元数据、夸克地址、解析状态、尝试次数及发现时间。
 - `crawl_runs`：每次任务的开始、结束、状态、处理数量和错误摘要。
 - `crawl_checkpoints`：为后续列表抓取和详情补全保存断点位置。
+- `crawl_locks`：防止相同全量列表任务并发写入，并支持超时接管异常遗留锁。
 
 同一详情页地址会执行 UPSERT，不会重复插入。可以通过参数指定其他数据库路径：
 
@@ -179,7 +194,7 @@ with database_connection(path) as db:
 '@ | python -
 ```
 
-预期数据库版本为 `2`，并且下面的命令返回 `True`：
+预期数据库版本为 `3`，并且下面的命令返回 `True`：
 
 ```powershell
 Test-Path .\data\verify.db
@@ -192,7 +207,7 @@ python scraper.py full-list --database data\verify.db --max-pages 2
 $LASTEXITCODE
 ```
 
-因为网站在第二页之后仍有下一页，程序应在成功写入两页后提示达到安全页数上限，退出码应为 `1`，本次运行状态应记录为 `incomplete`。这是预期的安全上限行为，不代表前两页写入失败。
+因为网站在第二页之后仍有下一页，程序应在成功写入两页后提示达到安全页数上限，退出码应为 `1`，本次运行状态应记录为 `incomplete`，checkpoint 应保存第三页地址。这是预期的安全上限行为，不代表前两页写入失败。
 
 ### 检查数据库结构、数据和运行记录
 
@@ -230,6 +245,18 @@ pending = db.execute("""
 """).fetchone()[0]
 print("符合详情初始状态的记录数：", pending)
 
+print("全量列表断点：")
+for row in db.execute("""
+    SELECT task_key, cursor, last_game_url, updated_at
+    FROM crawl_checkpoints
+    ORDER BY updated_at DESC
+"""):
+    print(row)
+
+print("当前任务锁：", db.execute(
+    "SELECT COUNT(*) FROM crawl_locks"
+).fetchone()[0])
+
 print("最近写入的游戏：")
 for row in db.execute("""
     SELECT name, category, score, size_text, source_updated_date
@@ -254,22 +281,31 @@ db.close()
 
 预期结果：
 
-- 数据库版本为 `2`。
-- 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`。
+- 数据库版本为 `3`。
+- 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`、`crawl_locks`。
 - 游戏总数大于 `0`，并与唯一详情地址数相同。
 - 游戏记录包含分类、评分、容量和站点日期等列表元数据。
 - 新入库且尚未处理的游戏符合五项详情初始状态。
 - 两页验证对应的最新运行记录为 `full-list`、`incomplete`。
+- checkpoint 的 `cursor` 指向下一页，命令退出后任务锁数量为 `0`。
 
-### 验证重复抓取不会产生重复游戏
+### 验证断点续跑
 
-再次执行两页验证：
+再次执行相同命令：
 
 ```powershell
 python scraper.py full-list --database data\verify.db --max-pages 2
 ```
 
-然后重新运行上一节的数据库检查命令。游戏总数可以因为网站新增内容而变化，但“游戏总数”和“唯一详情地址数”必须保持相同。
+本次应从原 checkpoint 指向的第三页继续，再处理两页并把 checkpoint 向后推进。重新运行上一节的数据库检查命令，“游戏总数”和“唯一详情地址数”必须保持相同。
+
+### 验证从头重新扫描
+
+```powershell
+python scraper.py full-list --database data\verify.db --max-pages 2 --restart
+```
+
+该命令会先删除当前列表入口的 checkpoint，再从第一页抓取。游戏仍通过 UPSERT 保存，不应产生重复详情地址。
 
 ### 正式执行
 
@@ -293,6 +329,6 @@ python scraper.py full-list
 
 查看正式数据库的最近运行记录时，把上述验证命令中的 `data/verify.db` 替换为 `data/xdgame.db`。
 
-当前全量列表有数百页，完整运行可能需要几十分钟。本阶段尚未实现断点续跑，正式运行时请避免主动中断；断点续跑将在下一阶段实现。
+当前全量列表有数百页，完整运行可能需要几十分钟。任务中断后重新执行相同命令即可从最近成功页面继续；如需明确从头扫描，再增加 `--restart`。
 
 请控制抓取频率，遵守目标网站规则，并仅访问本人有权获取的内容。

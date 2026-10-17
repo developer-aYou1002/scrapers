@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 
-DATABASE_VERSION = 2
+DATABASE_VERSION = 3
+LOCK_STALE_SECONDS = 30 * 60
 DATABASE_MIGRATIONS = {
     1: (
         """
@@ -56,6 +59,16 @@ DATABASE_MIGRATIONS = {
         "ALTER TABLE games ADD COLUMN size_text TEXT",
         "ALTER TABLE games ADD COLUMN source_updated_date TEXT",
         "ALTER TABLE games ADD COLUMN cover_url TEXT",
+    ),
+    3: (
+        """
+        CREATE TABLE crawl_locks (
+            task_key TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            acquired_at REAL NOT NULL,
+            heartbeat_at REAL NOT NULL
+        )
+        """,
     ),
 }
 
@@ -243,6 +256,64 @@ def load_checkpoint(connection: sqlite3.Connection, task_key: str) -> CrawlCheck
     if row is None:
         return None
     return CrawlCheckpoint(cursor=row["cursor"], last_game_url=row["last_game_url"])
+
+
+def delete_checkpoint(connection: sqlite3.Connection, task_key: str) -> None:
+    connection.execute(
+        "DELETE FROM crawl_checkpoints WHERE task_key = ?",
+        (task_key,),
+    )
+
+
+@contextmanager
+def crawl_task_lock(
+    connection: sqlite3.Connection,
+    task_key: str,
+) -> Iterator[str]:
+    owner = uuid.uuid4().hex
+    acquired_at = time.time()
+    stale_before = acquired_at - LOCK_STALE_SECONDS
+    # 仅允许接管长时间未刷新心跳的遗留锁，活跃任务的锁不会被覆盖。
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO crawl_locks (task_key, owner, acquired_at, heartbeat_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_key) DO UPDATE SET
+                owner = excluded.owner,
+                acquired_at = excluded.acquired_at,
+                heartbeat_at = excluded.heartbeat_at
+            WHERE crawl_locks.heartbeat_at < ?
+            """,
+            (task_key, owner, acquired_at, acquired_at, stale_before),
+        )
+    if cursor.rowcount != 1:
+        raise RuntimeError("相同的全量列表任务正在运行，请勿重复启动")
+    try:
+        yield owner
+    finally:
+        with connection:
+            connection.execute(
+                "DELETE FROM crawl_locks WHERE task_key = ? AND owner = ?",
+                (task_key, owner),
+            )
+
+
+def refresh_crawl_lock(
+    connection: sqlite3.Connection,
+    task_key: str,
+    owner: str,
+) -> None:
+    cursor = connection.execute(
+        """
+        UPDATE crawl_locks
+        SET heartbeat_at = ?
+        WHERE task_key = ? AND owner = ?
+        """,
+        (time.time(), task_key, owner),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("全量列表任务锁已失效，已停止写入")
 
 
 def start_crawl_run(connection: sqlite3.Connection, run_type: str) -> int:
