@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -10,9 +11,12 @@ import requests
 
 from .crawler import LINK_ATTRIBUTES, QUARK_PATTERN, create_session, extract_quark_url
 from .database import DetailCandidate, DetailUpdate, now_iso
+from .errors import LoginStateExpired
+from .login import page_requires_login
 
 
 FORBIDDEN_MARKERS = ("无权限", "权限不足", "仅限会员", "会员可见", "开通会员")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,10 +43,6 @@ class BrowserRequest:
     candidate: DetailCandidate
     candidates: list[str]
     config: EnrichConfig
-
-
-class LoginStateExpired(RuntimeError):
-    """详情页需要重新登录，当前批次必须停止。"""
 
 
 class BrowserUnavailable(RuntimeError):
@@ -85,6 +85,8 @@ class DetailResolver:
         wait_for_request(self.config, "浏览器回退")
         try:
             return self._resolve_browser(candidate)
+        except LoginStateExpired as error:
+            return DetailResolution(None, "登录状态已失效", "login_expired", str(error))
         except BrowserUnavailable:
             raise
         except Exception as error:
@@ -126,10 +128,15 @@ class DetailResolver:
 
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(headless=self.config.headless)
-            state = str(self.config.login_state) if self.config.login_state.exists() else None
-            self.context = self.browser.new_context(storage_state=state)
         except Exception as error:
             raise BrowserUnavailable(f"浏览器初始化失败：{error}") from error
+        state = str(self.config.login_state) if self.config.login_state.exists() else None
+        try:
+            self.context = self.browser.new_context(storage_state=state)
+        except Exception as error:
+            if state is not None:
+                raise LoginStateExpired("登录状态文件无法加载，请重新登录") from error
+            raise BrowserUnavailable(f"浏览器上下文初始化失败：{error}") from error
         return self.context
 
 
@@ -163,10 +170,6 @@ def resolve_browser_page(request: BrowserRequest) -> DetailResolution:
     if page_has_forbidden_marker(page):
         return DetailResolution(None, "无权限访问夸克地址", "forbidden", "页面提示需要会员或访问权限")
     return DetailResolution(None, "夸克入口页面结构变化", "structure_changed", "点击入口后未发现夸克地址")
-
-
-def page_requires_login(page: Any) -> bool:
-    return page.locator("#useridl").count() > 0
 
 
 def page_has_forbidden_marker(page: Any) -> bool:
@@ -281,7 +284,7 @@ def build_detail_update(
 
 def wait_for_request(config: EnrichConfig, reason: str) -> None:
     delay = random.uniform(config.delay_min, config.delay_max)
-    print(f"等待 {delay:.1f} 秒后进行{reason}，降低请求频率。")
+    LOGGER.info("等待 %.1f 秒后进行%s，降低请求频率", delay, reason)
     time.sleep(delay)
 
 

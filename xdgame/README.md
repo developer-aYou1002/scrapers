@@ -10,6 +10,7 @@
 - 支持日常增量扫描，更新已有列表元数据，并优先补全当天新增记录。
 - 详情页没有公开夸克地址时，使用 Playwright 执行 JavaScript 并点击“夸克网盘”。
 - 使用 Python 内置 SQLite 保存游戏、运行记录和后续断点续跑所需的 checkpoint。
+- 使用带运行标识的控制台与轮转文件日志，并对登录敏感信息统一脱敏。
 - 支持保存本人账号的合法登录状态，不会把账号密码写入代码或结果文件。
 - 不会绕过验证码、会员权限或其他访问控制。
 
@@ -23,6 +24,8 @@
 - `xdgame_scraper/daily.py`：日常列表扫描、新增识别和安全停止判断。
 - `xdgame_scraper/database.py`：SQLite 初始化、迁移、事务及数据访问。
 - `xdgame_scraper/login.py`：登录表单填写、人工验证回退和登录状态保存。
+- `xdgame_scraper/logging_setup.py`：日志初始化、文件轮转、运行标识和敏感信息脱敏。
+- `xdgame_scraper/errors.py`：跨抓取流程共享的登录失效与用户中断错误类型。
 - `xdgame_scraper/__main__.py`：支持模块方式启动。
 
 ## 安装
@@ -166,7 +169,7 @@ python scraper.py enrich --batch-size 20 --max-attempts 3 --delay-min 2 --delay-
 
 - `complete`：成功取得夸克地址。
 - `retry`：临时失败，后续批次继续尝试；累计 3 次后转为 `failed`。
-- `login_expired`：登录状态失效，当前批次立即停止并返回非零退出码；重新执行 `login` 后可继续。
+- `login_expired`：登录状态失效，当前批次立即停止并返回退出码 `3`；重新执行 `login` 后可继续。
 - `forbidden`：页面明确提示无权限或需要会员。
 - `not_found`：详情页没有夸克网盘入口。
 - `structure_changed`：入口存在但未按预期返回地址，或页面结构异常。
@@ -196,7 +199,7 @@ python scraper.py daily
 python scraper.py daily --max-pages 20 --existing-page-limit 5 --batch-size 30
 ```
 
-如果到达页数上限时最后一页仍发现新游戏，已扫描页面和已处理详情会保留，`crawl_runs` 状态记录为 `incomplete`，命令返回退出码 `1`。扩大 `--max-pages` 后重新运行即可。连续无新增提前停止、到达列表末页，或到达上限时最后一页已经无新增，退出码为 `0`；登录失效、网络或数据库错误同样返回 `1`。
+如果到达页数上限时最后一页仍发现新游戏，已扫描页面和已处理详情会保留，`crawl_runs` 状态记录为 `incomplete`，命令返回退出码 `1`。扩大 `--max-pages` 后重新运行即可。连续无新增提前停止、到达列表末页，或到达上限时最后一页已经无新增，退出码为 `0`；登录失效统一返回 `3`，其他网络或数据库错误返回 `1`。
 
 `daily` 与独立 `enrich` 共用详情任务锁，并与相同列表入口的 `full-list` 共用列表任务锁，避免两个进程重复补全或同时扫描同一列表。
 
@@ -237,7 +240,7 @@ Enable-ScheduledTask -TaskName "XDGAME 每日增量更新"
 Unregister-ScheduledTask -TaskName "XDGAME 每日增量更新" -Confirm
 ```
 
-计划任务参数不包含站点账号、密码、Cookie 或登录状态内容。当前阶段未手动触发任务；首次实际运行结果可通过 `Get-ScheduledTaskInfo` 和数据库 `crawl_runs` 检查。文件日志将在后续日志阶段接入。
+计划任务参数不包含站点账号、密码、Cookie 或登录状态内容。当前阶段未手动触发任务；首次实际运行结果可通过 `Get-ScheduledTaskInfo`、数据库 `crawl_runs` 和 `logs\xdgame.log` 检查。
 
 ### 迁移到另一台电脑
 
@@ -301,6 +304,40 @@ Register-ScheduledTask -TaskName $taskName -InputObject $task
 ```
 
 创建后使用本节前面的查看命令核对任务。如果这是永久迁移，确认新电脑首次运行正常后，再使用前面的禁用命令停用旧电脑任务，避免两台机器重复抓取。
+
+## 运行日志与退出码
+
+所有命令都会同时输出控制台日志和轮转文件日志。默认日志文件为 `logs\xdgame.log`，单个文件达到 5 MiB 后自动轮转，最多保留 5 份历史文件，例如 `xdgame.log.1`。`logs/` 已被 Git 忽略，日志不会提交到仓库。
+
+每次启动会生成 12 位运行标识，日志中的同一次执行都带有相同的 `[run=...]`。日志会记录命令、处理阶段、页数、记录数、重试状态、最终退出码和耗时。账号、密码、Cookie、授权令牌及当前环境变量中的登录值会在写入控制台和文件前统一脱敏。
+
+查看最近日志：
+
+```powershell
+Get-Content .\logs\xdgame.log -Tail 100
+```
+
+持续观察计划任务日志：
+
+```powershell
+Get-Content .\logs\xdgame.log -Wait -Tail 50
+```
+
+需要将日志写到其他位置时使用绝对路径：
+
+```powershell
+python scraper.py daily --log-file D:\XDGAME-Logs\xdgame.log
+```
+
+退出码含义：
+
+- `0`：任务正常完成。
+- `1`：普通运行失败，或日常列表达到页数上限后仍未安全收敛。
+- `2`：命令行参数无效，由 `argparse` 返回。
+- `3`：登录状态失效；执行 `python scraper.py login` 重新登录后，再运行原命令。
+- `130`：用户通过键盘中断任务。
+
+登录失效仅通过日志和退出码反馈，不发送 Windows 通知或 Webhook。Windows 计划任务会把任何非零退出码视为失败并按已配置策略重试；排查时应先按日志中的运行标识查找同一次执行的错误摘要。
 
 ## SQLite 数据库
 
@@ -498,7 +535,7 @@ db.close()
 '@ | python -
 ```
 
-预期单次最多处理 2 条，成功记录为 `complete`、尝试次数归零且写入 `quark_checked_at`。临时失败会累计尝试次数；重新执行命令只选择剩余待处理或允许重试的记录。登录失效时退出码为 `1`，已处理记录仍保留。
+预期单次最多处理 2 条，成功记录为 `complete`、尝试次数归零且写入 `quark_checked_at`。临时失败会累计尝试次数；重新执行命令只选择剩余待处理或允许重试的记录。登录失效时退出码为 `3`，已处理记录仍保留。
 
 ### 验证日常增量更新
 

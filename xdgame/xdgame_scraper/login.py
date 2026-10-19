@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def page_requires_login(page: Any) -> bool:
+    return page.locator("#useridl").count() > 0 and page.locator("#pwdl").count() > 0
 
 
 def fill_login_form(page: Any) -> bool:
@@ -62,7 +70,7 @@ def save_login_state(url: str, output: Path, timeout: float) -> None:
             timeout_ms = int(timeout * 1000)
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             if fill_login_form(page):
-                print("账号密码已自动填写。")
+                LOGGER.info("账号密码已自动填写")
                 wait_and_submit_login(page, timeout_ms)
             else:
                 wait_for_manual_login(page, "未检测到完整的账号环境变量")
@@ -78,4 +86,4 @@ def save_login_state(url: str, output: Path, timeout: float) -> None:
             finally:
                 if browser is not None:
                     browser.close()
-    print(f"登录状态已保存至：{output}")
+    LOGGER.info("登录状态已保存至：%s", output)

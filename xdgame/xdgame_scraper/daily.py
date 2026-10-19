@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 
 from .crawler import create_session
 from .database import existing_game_urls, refresh_crawl_lock, upsert_list_games
 from .list_crawler import ListPage, fetch_list_page, wait_for_next_page
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -106,9 +110,12 @@ def crawl_daily_list(
             page = fetch_list_page(session, current_url, config.timeout)
             new_urls = store_daily_page(connection, page, task_lock)
             update_daily_progress(progress, page, new_urls)
-            print(
-                f"日常扫描第 {progress.pages} 页：本页 {len(page.games)} 条，"
-                f"新增 {len(new_urls)} 条，累计新增 {progress.new_games} 条。"
+            LOGGER.info(
+                "日常扫描第 %d 页：本页 %d 条，新增 %d 条，累计新增 %d 条",
+                progress.pages,
+                len(page.games),
+                len(new_urls),
+                progress.new_games,
             )
             if should_stop_daily(progress, config, page.next_url is not None):
                 break

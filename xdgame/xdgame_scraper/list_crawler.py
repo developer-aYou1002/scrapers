@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
@@ -12,6 +13,7 @@ from bs4 import BeautifulSoup
 
 
 DEFAULT_LIST_URL = "https://www.xdgame.com/list/1/"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,5 +121,5 @@ def fetch_list_page(
 
 def wait_for_next_page(config: DelayConfig) -> None:
     delay = random.uniform(config.delay_min, config.delay_max)
-    print(f"等待 {delay:.1f} 秒后抓取下一页。")
+    LOGGER.info("等待 %.1f 秒后抓取下一页", delay)
     time.sleep(delay)

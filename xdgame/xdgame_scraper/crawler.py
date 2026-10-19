@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
@@ -13,10 +14,14 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .errors import LoginStateExpired
+from .login import page_requires_login
+
 
 DEFAULT_URL = "https://www.xdgame.com/"
 QUARK_PATTERN = re.compile(r"https?://pan\.quark\.cn/s/[A-Za-z0-9_-]+")
 LINK_ATTRIBUTES = ("href", "data-url", "data-href", "data-link", "onclick")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,7 @@ def enrich_from_html(
 ) -> list[dict[str, Any]]:
     unresolved: list[dict[str, Any]] = []
     for index, game in enumerate(games, start=1):
-        print(f"[{index}/{len(games)}] 读取详情页：{game['name']}")
+        LOGGER.info("[%d/%d] 读取详情页：%s", index, len(games), game["name"])
         try:
             response = session.get(game["url"], timeout=config.timeout)
             response.raise_for_status()
@@ -128,7 +133,7 @@ def wait_before_next(index: int, total: int, config: ScrapeConfig) -> None:
     if index >= total:
         return
     delay = random.uniform(config.delay_min, config.delay_max)
-    print(f"等待 {delay:.1f} 秒后继续，降低请求频率。")
+    LOGGER.info("等待 %.1f 秒后继续，降低请求频率", delay)
     time.sleep(delay)
 
 
@@ -151,6 +156,8 @@ def resolve_with_browser(page: Any, game: dict[str, Any], timeout_ms: int) -> No
     candidates: list[str] = []
     page.on("response", lambda response: collect_response_url(response, candidates))
     page.goto(game["url"], wait_until="domcontentloaded", timeout=timeout_ms)
+    if page_requires_login(page):
+        raise LoginStateExpired("详情页要求重新登录")
 
     quark_url = extract_quark_url(page.content())
     if quark_url:
@@ -202,12 +209,19 @@ def enrich_with_browser(games: list[dict[str, Any]], config: ScrapeConfig) -> No
         context = None
         try:
             # 所有页面复用同一上下文，确保登录 Cookie 一致，同时每个游戏使用独立页面避免跳转互相干扰。
-            context = browser.new_context(storage_state=state)
+            try:
+                context = browser.new_context(storage_state=state)
+            except Exception as error:
+                if state is not None:
+                    raise LoginStateExpired("登录状态文件无法加载，请重新登录") from error
+                raise
             for index, game in enumerate(games, start=1):
-                print(f"[{index}/{len(games)}] 浏览器解析：{game['name']}")
+                LOGGER.info("[%d/%d] 浏览器解析：%s", index, len(games), game["name"])
                 page = context.new_page()
                 try:
                     resolve_with_browser(page, game, timeout_ms)
+                except LoginStateExpired:
+                    raise
                 except Exception as error:
                     game["quark_status"] = f"浏览器解析失败：{error}"
                 finally:

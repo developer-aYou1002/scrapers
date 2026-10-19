@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -39,10 +41,10 @@ from .daily import (
 from .detail_enricher import (
     DetailResolver,
     EnrichConfig,
-    LoginStateExpired,
     build_detail_update,
     wait_between_candidates,
 )
+from .errors import LoginStateExpired, TaskInterrupted
 from .list_crawler import (
     DEFAULT_LIST_URL,
     FullListConfig,
@@ -50,6 +52,7 @@ from .list_crawler import (
     wait_for_next_page,
 )
 from .login import save_login_state
+from .logging_setup import LoggingConfig, configure_logging
 
 
 DEFAULT_LOGIN_URL = "https://www.xdgame.com/user/"
@@ -57,6 +60,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_DIR / "output/today_games.json"
 DEFAULT_LOGIN_STATE = PROJECT_DIR / "login_state.json"
 DEFAULT_DATABASE = PROJECT_DIR / "data/xdgame.db"
+DEFAULT_LOG_FILE = PROJECT_DIR / "logs/xdgame.log"
 DEFAULT_DELAY_MIN = 2.0
 DEFAULT_DELAY_MAX = 4.0
 DEFAULT_MAX_PAGES = 1000
@@ -66,6 +70,10 @@ DEFAULT_BATCH_SIZE = 20
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RECHECK_DAYS = 30
 DETAIL_TASK_KEY = "detail-enrichment"
+EXIT_FAILURE = 1
+EXIT_LOGIN_EXPIRED = 3
+EXIT_INTERRUPTED = 130
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -184,6 +192,7 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE, help="SQLite 数据库路径")
+    parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="轮转日志文件路径")
     parser.add_argument("--timeout", type=float, default=20, help="请求超时秒数")
     parser.add_argument("--login-state", type=Path, default=DEFAULT_LOGIN_STATE)
     parser.add_argument("--login", action="store_true", help="打开浏览器并保存登录状态")
@@ -333,9 +342,11 @@ def crawl_full_list(
                 refresh_crawl_lock(connection, progress.task_key, progress.lock_owner)
             progress.pages += 1
             progress.games += len(page.games)
-            print(
-                f"已写入第 {progress.pages} 页，"
-                f"本页 {len(page.games)} 条，累计 {progress.games} 条。"
+            LOGGER.info(
+                "已写入第 %d 页，本页 %d 条，累计 %d 条",
+                progress.pages,
+                len(page.games),
+                progress.games,
             )
             progress.current_url = page.next_url
             if progress.current_url is not None and progress.pages >= config.max_pages:
@@ -378,7 +389,7 @@ def run_full_list(args: argparse.Namespace) -> FullListProgress:
                 run_id = start_crawl_run(connection, "full-list")
             try:
                 if progress.current_url is None:
-                    print("全量列表 checkpoint 已完成；如需重扫请使用 --restart。")
+                    LOGGER.info("全量列表 checkpoint 已完成；如需重扫请使用 --restart")
                 else:
                     crawl_full_list(connection, config, progress)
                 with connection:
@@ -389,7 +400,7 @@ def run_full_list(args: argparse.Namespace) -> FullListProgress:
                 outcome = CrawlRunOutcome("incomplete", progress.games, summary[:1000])
                 record_run_outcome(connection, run_id, outcome)
                 if isinstance(error, KeyboardInterrupt):
-                    raise RuntimeError("用户中断；已保留最近成功页面的断点") from None
+                    raise TaskInterrupted("用户中断；已保留最近成功页面的断点") from None
                 raise
             except Exception as error:
                 outcome = CrawlRunOutcome("failed", progress.games, str(error)[:1000])
@@ -405,7 +416,12 @@ def enrich_candidates(
 ) -> EnrichProgress:
     with DetailResolver(batch.config) as resolver:
         for index, candidate in enumerate(batch.candidates, start=1):
-            print(f"[{index}/{len(batch.candidates)}] 补全详情：{candidate.name}")
+            LOGGER.info(
+                "[%d/%d] 补全详情：%s",
+                index,
+                len(batch.candidates),
+                candidate.name,
+            )
             resolution = resolver.resolve(candidate)
             update = build_detail_update(
                 candidate,
@@ -420,7 +436,12 @@ def enrich_candidates(
                 progress.completed += 1
             else:
                 progress.errors += 1
-            print(f"详情状态：{update.detail_status}；夸克状态：{update.quark_status}")
+            LOGGER.info(
+                "详情状态：%s；夸克状态：%s；累计尝试：%d",
+                update.detail_status,
+                update.quark_status,
+                update.detail_attempts,
+            )
             if update.detail_status == "login_expired":
                 raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行当前任务")
             wait_between_candidates(batch.config, index, len(batch.candidates))
@@ -449,7 +470,7 @@ def run_enrich(args: argparse.Namespace) -> EnrichProgress:
             except KeyboardInterrupt:
                 outcome = CrawlRunOutcome("incomplete", progress.processed, "用户中断详情补全")
                 record_run_outcome(connection, run_id, outcome)
-                raise RuntimeError("用户中断；已保留逐条提交的详情结果") from None
+                raise TaskInterrupted("用户中断；已保留逐条提交的详情结果") from None
             except Exception as error:
                 outcome = CrawlRunOutcome("failed", progress.processed, str(error)[:1000])
                 record_run_outcome(connection, run_id, outcome)
@@ -462,6 +483,7 @@ def execute_daily(
     runtime: DailyRuntime,
     progress: DailyProgress,
 ) -> None:
+    LOGGER.info("阶段开始：日常列表扫描")
     progress.list_progress = crawl_daily_list(
         connection,
         runtime.list_config,
@@ -471,6 +493,7 @@ def execute_daily(
     selection = replace(runtime.selection, priority_urls=priority_urls)
     candidates = load_detail_candidates(connection, selection)
     progress.detail_progress = EnrichProgress(selected=len(candidates))
+    LOGGER.info("阶段开始：详情补全；本批选取 %d 条", len(candidates))
     batch = EnrichBatch(
         candidates,
         runtime.enrich_config,
@@ -533,7 +556,7 @@ def run_daily_locked(
             "用户中断日常更新",
         )
         record_run_outcome(connection, run_id, outcome)
-        raise RuntimeError("用户中断；已保留逐页和逐条提交的结果") from None
+        raise TaskInterrupted("用户中断；已保留逐页和逐条提交的结果") from None
     except Exception as error:
         outcome = CrawlRunOutcome(
             "failed",
@@ -546,52 +569,119 @@ def run_daily_locked(
 
 def main() -> int:
     args = parse_args()
-    try:
-        if args.command == "login" or args.login:
-            save_login_state(args.login_url, args.login_state, args.login_timeout)
-            return 0
-        if args.command == "full-list":
-            progress = run_full_list(args)
-            print(
-                f"全量列表抓取完成：{progress.pages} 页，"
-                f"共处理 {progress.games} 条记录。"
-            )
-            print(f"数据库已更新：{args.database}")
-            return 0
-        if args.command == "enrich":
-            progress = run_enrich(args)
-            print(
-                f"详情补全完成：选取 {progress.selected} 条，"
-                f"处理 {progress.processed} 条，成功 {progress.completed} 条，"
-                f"其他状态 {progress.errors} 条。"
-            )
-            print(f"数据库已更新：{args.database}")
-            return 0
-        if args.command == "daily":
-            progress = run_daily(args)
-            print_daily_summary(progress, args.database)
-            return 1 if progress.list_progress.incomplete else 0
-        games = run_scrape(args)
-    except (requests.RequestException, sqlite3.Error, RuntimeError, ValueError, OSError) as error:
-        print(f"执行失败：{error}", file=sys.stderr)
-        return 1
+    if not initialize_logging(args.log_file):
+        return EXIT_FAILURE
+    started_at = time.monotonic()
+    command = "login" if args.login else args.command
+    LOGGER.info("任务开始：命令=%s", command)
+    exit_code = execute_safely(args)
+    elapsed = time.monotonic() - started_at
+    log_run_finished(command, exit_code, elapsed)
+    return exit_code
 
-    quark_count = sum(bool(game["quark_url"]) for game in games)
-    print(f"已抓取 {len(games)} 个游戏，其中 {quark_count} 个获得夸克地址")
-    print(f"结果已保存至：{args.output}")
-    print(f"数据库已更新：{args.database}")
+
+def initialize_logging(path: Path) -> bool:
+    try:
+        configure_logging(LoggingConfig(path))
+    except OSError as error:
+        sys.stderr.write(f"无法初始化日志文件：{error}\n")
+        return False
+    return True
+
+
+def execute_safely(args: argparse.Namespace) -> int:
+    try:
+        return execute_command(args)
+    except LoginStateExpired as error:
+        LOGGER.error("登录状态已失效：%s；请执行 python scraper.py login 后重试", error)
+        return EXIT_LOGIN_EXPIRED
+    except (TaskInterrupted, KeyboardInterrupt) as error:
+        LOGGER.error("用户中断任务：%s", str(error) or "已停止")
+        return EXIT_INTERRUPTED
+    except (requests.RequestException, sqlite3.Error, RuntimeError, ValueError, OSError) as error:
+        LOGGER.error("执行失败：%s", error)
+        return EXIT_FAILURE
+    except Exception as error:
+        # 未预期异常也必须让计划任务得到失败码；不输出堆栈可避免第三方异常携带敏感页面数据。
+        LOGGER.error("未预期错误：%s", error)
+        return EXIT_FAILURE
+
+
+def execute_command(args: argparse.Namespace) -> int:
+    if args.command == "login" or args.login:
+        save_login_state(args.login_url, args.login_state, args.login_timeout)
+        return 0
+    if args.command == "full-list":
+        return execute_full_list_command(args)
+    if args.command == "enrich":
+        return execute_enrich_command(args)
+    if args.command == "daily":
+        return execute_daily_command(args)
+    return execute_today_command(args)
+
+
+def execute_full_list_command(args: argparse.Namespace) -> int:
+    progress = run_full_list(args)
+    LOGGER.info(
+        "全量列表抓取完成：%d 页，共处理 %d 条记录；数据库=%s",
+        progress.pages,
+        progress.games,
+        args.database,
+    )
     return 0
 
 
-def print_daily_summary(progress: DailyProgress, database: Path) -> None:
+def execute_enrich_command(args: argparse.Namespace) -> int:
+    progress = run_enrich(args)
+    LOGGER.info(
+        "详情补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条；数据库=%s",
+        progress.selected,
+        progress.processed,
+        progress.completed,
+        progress.errors,
+        args.database,
+    )
+    return 0
+
+
+def execute_daily_command(args: argparse.Namespace) -> int:
+    progress = run_daily(args)
+    log_daily_summary(progress, args.database)
+    return EXIT_FAILURE if progress.list_progress.incomplete else 0
+
+
+def execute_today_command(args: argparse.Namespace) -> int:
+    games = run_scrape(args)
+    quark_count = sum(bool(game["quark_url"]) for game in games)
+    LOGGER.info(
+        "今日更新完成：抓取 %d 个游戏，%d 个获得夸克地址；输出=%s；数据库=%s",
+        len(games),
+        quark_count,
+        args.output,
+        args.database,
+    )
+    return 0
+
+
+def log_run_finished(command: str, exit_code: int, elapsed: float) -> None:
+    log = LOGGER.info if exit_code == 0 else LOGGER.error
+    log("任务结束：命令=%s；退出码=%d；耗时=%.1f 秒", command, exit_code, elapsed)
+
+
+def log_daily_summary(progress: DailyProgress, database: Path) -> None:
     listing = progress.list_progress
     details = progress.detail_progress
-    print(
-        f"日常更新完成：扫描 {listing.pages} 页、{listing.games} 条，"
-        f"新增 {listing.new_games} 条；详情处理 {details.processed} 条，"
-        f"成功 {details.completed} 条，其他状态 {details.errors} 条。"
+    LOGGER.info(
+        "日常更新完成：扫描 %d 页、%d 条，新增 %d 条；"
+        "详情处理 %d 条，成功 %d 条，其他状态 %d 条",
+        listing.pages,
+        listing.games,
+        listing.new_games,
+        details.processed,
+        details.completed,
+        details.errors,
     )
-    print(f"停止原因：{listing.stop_reason}")
+    LOGGER.info("停止原因：%s", listing.stop_reason)
     if listing.incomplete:
-        print("日常扫描尚未安全收敛，请扩大 --max-pages 后重新运行。", file=sys.stderr)
-    print(f"数据库已更新：{database}")
+        LOGGER.error("日常扫描尚未安全收敛，请扩大 --max-pages 后重新运行")
+    LOGGER.info("数据库已更新：%s", database)
