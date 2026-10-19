@@ -200,6 +200,108 @@ python scraper.py daily --max-pages 20 --existing-page-limit 5 --batch-size 30
 
 `daily` 与独立 `enrich` 共用详情任务锁，并与相同列表入口的 `full-list` 共用列表任务锁，避免两个进程重复补全或同时扫描同一列表。
 
+## Windows 定时任务
+
+当前电脑已创建计划任务 `XDGAME 每日增量更新`，每天 `23:00` 执行：
+
+```text
+E:\Python\Python314\python.exe "E:\Code\MyProjects\scrapers\xdgame\scraper.py" daily
+```
+
+任务工作目录为 `E:\Code\MyProjects\scrapers\xdgame`，使用当前 Windows 用户的交互式登录令牌，不保存账号密码。任务设置包括：
+
+- 仅在用户保持登录时运行；锁屏和关闭显示器不影响执行，注销或关机后不能运行。
+- 允许唤醒电脑运行，并在错过计划时间后尽快补跑；实际唤醒能力取决于系统电源计划和硬件设置。
+- 失败后每 15 分钟重试一次，最多重试 3 次。
+- 单次最长运行 4 小时；已有实例运行时不启动重复实例。
+- 允许使用电池启动，切换到电池供电后不强制停止。
+
+查看任务及下次运行时间：
+
+```powershell
+Get-ScheduledTask -TaskName "XDGAME 每日增量更新"
+Get-ScheduledTaskInfo -TaskName "XDGAME 每日增量更新"
+```
+
+手动触发、禁用和重新启用：
+
+```powershell
+Start-ScheduledTask -TaskName "XDGAME 每日增量更新"
+Disable-ScheduledTask -TaskName "XDGAME 每日增量更新"
+Enable-ScheduledTask -TaskName "XDGAME 每日增量更新"
+```
+
+不再需要时删除任务，执行前 PowerShell 会要求确认：
+
+```powershell
+Unregister-ScheduledTask -TaskName "XDGAME 每日增量更新" -Confirm
+```
+
+计划任务参数不包含站点账号、密码、Cookie 或登录状态内容。当前阶段未手动触发任务；首次实际运行结果可通过 `Get-ScheduledTaskInfo` 和数据库 `crawl_runs` 检查。文件日志将在后续日志阶段接入。
+
+### 迁移到另一台电脑
+
+Windows 计划任务、SQLite 数据库和登录状态不会随 Git 同步。新电脑需要分别部署代码、初始化本地运行数据并重新创建计划任务。
+
+获取代码并进入项目目录：
+
+```powershell
+git clone https://github.com/developer-aYou1002/scrapers.git
+cd .\scrapers\xdgame
+```
+
+建议为新电脑创建独立虚拟环境，再按前文“安装”章节安装依赖：
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+按照“首次登录”章节在新电脑重新生成 `login_state.json`，不要通过 Git 或不安全渠道传输旧电脑的 Cookie。数据库可以选择重新执行 `full-list` 创建，也可以在停止旧电脑任务和抓取进程后，将 `data\xdgame.db` 一次性安全复制到新电脑；禁止两台电脑同时写同一个网络共享数据库。
+
+完成前文人工验证后，在新电脑的项目目录运行以下 PowerShell。命令会根据当前位置、虚拟环境和当前 Windows 账户生成绝对路径，并创建与本机相同策略的每日任务：
+
+```powershell
+$taskName = "XDGAME 每日增量更新"
+$projectDir = (Resolve-Path .).Path
+$pythonPath = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+$scriptPath = (Resolve-Path ".\scraper.py").Path
+$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    throw "计划任务已存在，未覆盖：$taskName"
+}
+
+$action = New-ScheduledTaskAction `
+    -Execute $pythonPath `
+    -Argument ('"' + $scriptPath + '" daily') `
+    -WorkingDirectory $projectDir
+$trigger = New-ScheduledTaskTrigger -Daily -At "23:00"
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $userId `
+    -LogonType Interactive `
+    -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -WakeToRun `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 15) `
+    -MultipleInstances IgnoreNew `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries
+$task = New-ScheduledTask `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal `
+    -Settings $settings `
+    -Description "每日增量抓取 XDGAME 数据；仅在用户登录会话中运行。"
+
+Register-ScheduledTask -TaskName $taskName -InputObject $task
+```
+
+创建后使用本节前面的查看命令核对任务。如果这是永久迁移，确认新电脑首次运行正常后，再使用前面的禁用命令停用旧电脑任务，避免两台机器重复抓取。
+
 ## SQLite 数据库
 
 抓取时会自动初始化并更新 `data/xdgame.db`，不需要手动建库。数据库结构使用 `PRAGMA user_version` 管理版本，重复运行不会重复建表或清空已有数据。
