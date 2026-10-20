@@ -135,6 +135,23 @@ def database_connection(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+@contextmanager
+def readonly_database_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    if not path.is_file():
+        raise FileNotFoundError(f"数据库不存在：{path}")
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != DATABASE_VERSION:
+            raise RuntimeError(
+                f"数据库版本为 {version}，请先使用当前程序完成迁移到 {DATABASE_VERSION}"
+            )
+        yield connection
+    finally:
+        connection.close()
+
+
 def initialize_database(connection: sqlite3.Connection) -> None:
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     if current_version > DATABASE_VERSION:
@@ -277,6 +294,20 @@ def existing_game_urls(
         detail_urls,
     ).fetchall()
     return {str(row["detail_url"]) for row in rows}
+
+
+def load_games_for_export(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT id, name, detail_url, category, score, size_text,
+               source_updated_date, cover_url, quark_url, quark_status,
+               detail_status, detail_attempts, last_error, quark_checked_at,
+               first_seen_at, last_seen_at, detail_updated_at, updated_at
+        FROM games
+        ORDER BY id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def load_detail_candidates(

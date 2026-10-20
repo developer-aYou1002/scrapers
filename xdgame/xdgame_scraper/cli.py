@@ -45,6 +45,7 @@ from .detail_enricher import (
     wait_between_candidates,
 )
 from .errors import LoginStateExpired, TaskInterrupted
+from .exporter import export_database
 from .list_crawler import (
     DEFAULT_LIST_URL,
     FullListConfig,
@@ -58,6 +59,7 @@ from .logging_setup import LoggingConfig, configure_logging
 DEFAULT_LOGIN_URL = "https://www.xdgame.com/user/"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_DIR / "output/today_games.json"
+DEFAULT_EXPORT_OUTPUT = PROJECT_DIR / "output/games.json"
 DEFAULT_LOGIN_STATE = PROJECT_DIR / "login_state.json"
 DEFAULT_DATABASE = PROJECT_DIR / "data/xdgame.db"
 DEFAULT_LOG_FILE = PROJECT_DIR / "logs/xdgame.log"
@@ -137,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("today", "login", "full-list", "enrich", "daily"),
+        choices=("today", "login", "full-list", "enrich", "daily", "export"),
         default="today",
     )
     add_list_arguments(parser)
@@ -190,7 +192,13 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="JSON 输出路径（today 和 export 使用各自默认文件）",
+    )
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE, help="SQLite 数据库路径")
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="轮转日志文件路径")
     parser.add_argument("--timeout", type=float, default=20, help="请求超时秒数")
@@ -302,6 +310,7 @@ def record_run_outcome(
 
 def run_scrape(args: argparse.Namespace) -> list[dict[str, Any]]:
     config = build_scrape_config(args)
+    output = args.output or DEFAULT_OUTPUT
     with database_connection(args.database) as connection:
         # 先提交 running 记录，网络或解析失败时才能在独立事务中留下失败结果。
         with connection:
@@ -311,7 +320,7 @@ def run_scrape(args: argparse.Namespace) -> list[dict[str, Any]]:
             # 游戏数据与成功状态原子提交，避免运行标记成功但游戏只写入一部分。
             with connection:
                 upsert_games(connection, games, "今日更新")
-                save_json(games, args.url, args.output)
+                save_json(games, args.url, output)
                 outcome = CrawlRunOutcome("success", len(games))
                 finish_crawl_run(connection, run_id, outcome)
         except Exception as error:
@@ -617,6 +626,8 @@ def execute_command(args: argparse.Namespace) -> int:
         return execute_enrich_command(args)
     if args.command == "daily":
         return execute_daily_command(args)
+    if args.command == "export":
+        return execute_export_command(args)
     return execute_today_command(args)
 
 
@@ -650,14 +661,28 @@ def execute_daily_command(args: argparse.Namespace) -> int:
     return EXIT_FAILURE if progress.list_progress.incomplete else 0
 
 
+def execute_export_command(args: argparse.Namespace) -> int:
+    output = args.output or DEFAULT_EXPORT_OUTPUT
+    result = export_database(args.database, output)
+    LOGGER.info(
+        "数据库导出完成：共 %d 条，详情完成 %d 条，含夸克地址 %d 条；输出=%s",
+        result.count,
+        result.complete_count,
+        result.quark_count,
+        result.output,
+    )
+    return 0
+
+
 def execute_today_command(args: argparse.Namespace) -> int:
     games = run_scrape(args)
     quark_count = sum(bool(game["quark_url"]) for game in games)
+    output = args.output or DEFAULT_OUTPUT
     LOGGER.info(
         "今日更新完成：抓取 %d 个游戏，%d 个获得夸克地址；输出=%s；数据库=%s",
         len(games),
         quark_count,
-        args.output,
+        output,
         args.database,
     )
     return 0

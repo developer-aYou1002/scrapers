@@ -23,6 +23,7 @@
 - `xdgame_scraper/detail_enricher.py`：详情分批补全、浏览器回退、状态分类与请求节流。
 - `xdgame_scraper/daily.py`：日常列表扫描、新增识别和安全停止判断。
 - `xdgame_scraper/database.py`：SQLite 初始化、迁移、事务及数据访问。
+- `xdgame_scraper/exporter.py`：从 SQLite 只读加载并原子导出完整 JSON。
 - `xdgame_scraper/login.py`：登录表单填写、人工验证回退和登录状态保存。
 - `xdgame_scraper/logging_setup.py`：日志初始化、文件轮转、运行标识和敏感信息脱敏。
 - `xdgame_scraper/errors.py`：跨抓取流程共享的登录失效与用户中断错误类型。
@@ -202,6 +203,24 @@ python scraper.py daily --max-pages 20 --existing-page-limit 5 --batch-size 30
 如果到达页数上限时最后一页仍发现新游戏，已扫描页面和已处理详情会保留，`crawl_runs` 状态记录为 `incomplete`，命令返回退出码 `1`。扩大 `--max-pages` 后重新运行即可。连续无新增提前停止、到达列表末页，或到达上限时最后一页已经无新增，退出码为 `0`；登录失效统一返回 `3`，其他网络或数据库错误返回 `1`。
 
 `daily` 与独立 `enrich` 共用详情任务锁，并与相同列表入口的 `full-list` 共用列表任务锁，避免两个进程重复补全或同时扫描同一列表。
+
+### 导出 SQLite 数据
+
+将当前数据库中的全部游戏导出为 JSON，不访问网站，也不修改游戏、断点或运行状态：
+
+```powershell
+python scraper.py export
+```
+
+默认输出为 `output/games.json`。可以覆盖输出路径：
+
+```powershell
+python scraper.py export --output output\custom-games.json
+```
+
+导出文件包含导出时间、记录总数、详情完成数、夸克地址数，以及 `games` 表中的全部业务字段。程序先完整写入同目录临时文件再替换目标文件，中断时不会破坏上一份成功导出；导出路径不能与 SQLite 数据库路径相同。
+
+数据库不存在或结构版本与当前程序不一致时，命令会返回退出码 `1`，不会创建空数据库或空 JSON。导出文件可能包含有效夸克地址，`output/` 已被 Git 忽略，请勿将文件提交到仓库或通过不安全渠道发送。
 
 ## Windows 定时任务
 
@@ -566,6 +585,25 @@ db.close()
 
 在仍持续出现新增数据时将 `--max-pages` 设为 `1`，预期退出码为 `1`，最新运行状态为 `incomplete`，已经扫描的列表记录不会回滚。
 
+### 验证数据库导出
+
+从验证数据库导出到独立文件：
+
+```powershell
+python scraper.py export --database data\verify.db --output output\verify-games.json
+$LASTEXITCODE
+```
+
+检查导出摘要、字段和记录数：
+
+```powershell
+$export = Get-Content .\output\verify-games.json -Raw | ConvertFrom-Json
+$export | Select-Object source, source_database, exported_at, count, complete_count, quark_count
+$export.games | Select-Object -First 1
+```
+
+预期退出码为 `0`，`count` 与验证数据库的 `games` 表数量一致，单条记录包含列表元数据、详情状态、夸克地址、错误和时间字段。`git status --short` 不应出现导出文件。
+
 ### 正式执行
 
 保存登录状态：
@@ -596,6 +634,12 @@ python scraper.py enrich
 
 ```powershell
 python scraper.py daily
+```
+
+导出当前数据库：
+
+```powershell
+python scraper.py export
 ```
 
 查看正式数据库的最近运行记录时，把上述验证命令中的 `data/verify.db` 替换为 `data/xdgame.db`。
