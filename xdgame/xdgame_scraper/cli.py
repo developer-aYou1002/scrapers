@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sqlite3
 import sys
 import time
@@ -93,6 +94,7 @@ class EnrichProgress:
     processed: int = 0
     completed: int = 0
     errors: int = 0
+    has_more: bool = False
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,12 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help="详情补全单批处理数量",
+    )
+    parser.add_argument(
+        "--batch-interval",
+        type=float,
+        default=None,
+        help="enrich 专用：批次间隔秒数；指定后持续处理至无候选记录",
     )
     parser.add_argument(
         "--max-attempts",
@@ -469,6 +477,9 @@ def run_enrich(args: argparse.Namespace) -> EnrichProgress:
             try:
                 batch = EnrichBatch(candidates, config, lock_owner, DETAIL_TASK_KEY)
                 progress = enrich_candidates(connection, batch, progress)
+                progress.has_more = bool(
+                    load_detail_candidates(connection, replace(selection, limit=1))
+                )
                 status = "success" if progress.errors == 0 else "completed_with_errors"
                 with connection:
                     finish_crawl_run(
@@ -643,16 +654,23 @@ def execute_full_list_command(args: argparse.Namespace) -> int:
 
 
 def execute_enrich_command(args: argparse.Namespace) -> int:
-    progress = run_enrich(args)
-    LOGGER.info(
-        "详情补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条；数据库=%s",
-        progress.selected,
-        progress.processed,
-        progress.completed,
-        progress.errors,
-        args.database,
-    )
-    return 0
+    interval = args.batch_interval
+    if interval is not None and (not math.isfinite(interval) or interval <= 0):
+        raise ValueError("batch-interval 必须是大于 0 的有限秒数")
+    while True:
+        progress = run_enrich(args)
+        LOGGER.info(
+            "详情补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条；数据库=%s",
+            progress.selected,
+            progress.processed,
+            progress.completed,
+            progress.errors,
+            args.database,
+        )
+        if interval is None or not progress.has_more:
+            return 0
+        LOGGER.info("等待 %.1f 秒后处理下一批详情", interval)
+        time.sleep(interval)
 
 
 def execute_daily_command(args: argparse.Namespace) -> int:

@@ -166,6 +166,14 @@ python scraper.py enrich
 python scraper.py enrich --batch-size 20 --max-attempts 3 --delay-min 2 --delay-max 4
 ```
 
+默认只处理一批。需要连续补全时，可指定批次间隔（单位：秒）；每批结束后若仍有可处理记录，等待指定时间再处理下一批，直到没有候选记录或任务出错：
+
+```bash
+.venv/bin/python scraper.py enrich --batch-size 50 --batch-interval 120
+```
+
+上述命令每批最多处理 50 条，批次之间等待 2 分钟；最后一批结束后不会额外等待。每批都会独立记录运行结果，已提交的数据在中断后仍会保留。`--batch-interval` 仅对 `enrich` 生效，不影响 `daily` 的单批补全。
+
 详情状态包括：
 
 - `complete`：成功取得夸克地址。
