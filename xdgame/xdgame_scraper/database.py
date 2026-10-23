@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-DATABASE_VERSION = 4
+DATABASE_VERSION = 5
 LOCK_STALE_SECONDS = 30 * 60
 DATABASE_MIGRATIONS = {
     1: (
@@ -74,6 +74,19 @@ DATABASE_MIGRATIONS = {
         "ALTER TABLE games ADD COLUMN quark_checked_at TEXT",
         "CREATE INDEX idx_games_quark_checked_at ON games(quark_checked_at)",
     ),
+    5: (
+        """
+        CREATE TABLE game_disk_links (
+            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            url TEXT,
+            status TEXT NOT NULL,
+            last_error TEXT,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (game_id, provider)
+        )
+        """,
+    ),
 }
 
 
@@ -116,6 +129,14 @@ class DetailUpdate:
     detail_attempts: int
     last_error: str | None
     checked_at: str | None
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    provider: str
+    url: str | None
+    status: str
+    error: str | None = None
 
 
 def now_iso() -> str:
@@ -307,7 +328,21 @@ def load_games_for_export(connection: sqlite3.Connection) -> list[dict[str, Any]
         ORDER BY id
         """
     ).fetchall()
-    return [dict(row) for row in rows]
+    games = [dict(row) for row in rows]
+    by_id = {game["id"]: game for game in games}
+    for game in games:
+        game["other_disk_links"] = {}
+    for row in connection.execute(
+        """SELECT game_id, provider, url, status, last_error, checked_at
+           FROM game_disk_links ORDER BY game_id, provider"""
+    ):
+        by_id[row["game_id"]]["other_disk_links"][row["provider"]] = {
+            "url": row["url"],
+            "status": row["status"],
+            "last_error": row["last_error"],
+            "checked_at": row["checked_at"],
+        }
+    return games
 
 
 def load_detail_candidates(
@@ -347,8 +382,8 @@ def detail_selection_query(selection: DetailSelection) -> tuple[str, tuple[Any, 
             CASE WHEN detail_status IN ('retry', 'login_expired', 'recheck_retry') THEN 0
                  WHEN detail_status = 'pending' THEN 1
                  ELSE 2 END,
-            -- 新入库的 pending 记录优先，防止日常新增长期排在全量历史积压之后。
-            CASE WHEN detail_status = 'pending' THEN id END DESC,
+            -- 全量列表从首页依次入库，普通 pending 按入库顺序补全；daily 新增由上方优先级单独保证。
+            CASE WHEN detail_status = 'pending' THEN id END ASC,
             COALESCE(detail_updated_at, first_seen_at),
             id
         LIMIT ?
@@ -403,6 +438,32 @@ def save_detail_result(
             timestamp,
             timestamp,
             game_id,
+        ),
+    )
+
+
+def save_provider_results(
+    connection: sqlite3.Connection,
+    game_id: int,
+    results: tuple[ProviderResult, ...],
+) -> None:
+    timestamp = now_iso()
+    connection.executemany(
+        """
+        INSERT INTO game_disk_links (game_id, provider, url, status, last_error, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_id, provider) DO UPDATE SET
+            url = COALESCE(excluded.url, game_disk_links.url),
+            status = CASE
+                WHEN excluded.url IS NOT NULL THEN 'complete'
+                WHEN game_disk_links.url IS NOT NULL THEN 'stale'
+                ELSE excluded.status END,
+            last_error = excluded.last_error,
+            checked_at = excluded.checked_at
+        """,
+        (
+            (game_id, item.provider, item.url, item.status, item.error, timestamp)
+            for item in results
         ),
     )
 

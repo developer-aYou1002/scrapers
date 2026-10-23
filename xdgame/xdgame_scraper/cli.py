@@ -28,6 +28,7 @@ from .database import (
     now_iso,
     refresh_crawl_lock,
     save_detail_result,
+    save_provider_results,
     save_checkpoint,
     start_crawl_run,
     upsert_games,
@@ -447,6 +448,7 @@ def enrich_candidates(
             )
             with connection:
                 save_detail_result(connection, candidate.id, update)
+                save_provider_results(connection, candidate.id, resolution.provider_results)
                 refresh_crawl_lock(connection, batch.task_key, batch.lock_owner)
             progress.processed += 1
             if update.detail_status == "complete":
@@ -454,9 +456,11 @@ def enrich_candidates(
             else:
                 progress.errors += 1
             LOGGER.info(
-                "详情状态：%s；夸克状态：%s；累计尝试：%d",
+                "详情状态：%s；夸克状态：%s；其他网盘成功：%d/%d；累计尝试：%d",
                 update.detail_status,
                 update.quark_status,
+                sum(item.url is not None for item in resolution.provider_results),
+                len(resolution.provider_results),
                 update.detail_attempts,
             )
             if update.detail_status == "login_expired":
@@ -683,10 +687,11 @@ def execute_export_command(args: argparse.Namespace) -> int:
     output = args.output or DEFAULT_EXPORT_OUTPUT
     result = export_database(args.database, output)
     LOGGER.info(
-        "数据库导出完成：共 %d 条，详情完成 %d 条，含夸克地址 %d 条；输出=%s",
+        "数据库导出完成：共 %d 条，详情完成 %d 条，含夸克地址 %d 条、其他网盘地址 %d 条；输出=%s",
         result.count,
         result.complete_count,
         result.quark_count,
+        result.other_disk_link_count,
         result.output,
     )
     return 0

@@ -14,6 +14,7 @@ class ExportResult:
     count: int
     complete_count: int
     quark_count: int
+    other_disk_link_count: int
 
 
 def export_database(database: Path, output: Path) -> ExportResult:
@@ -28,6 +29,7 @@ def export_database(database: Path, output: Path) -> ExportResult:
         len(games),
         int(payload["complete_count"]),
         int(payload["quark_count"]),
+        int(payload["other_disk_link_count"]),
     )
 
 
@@ -39,6 +41,11 @@ def build_export_payload(database: Path, games: list[dict[str, Any]]) -> dict[st
         "count": len(games),
         "complete_count": sum(game["detail_status"] == "complete" for game in games),
         "quark_count": sum(bool(game["quark_url"]) for game in games),
+        "other_disk_link_count": sum(
+            bool(link["url"])
+            for game in games
+            for link in game["other_disk_links"].values()
+        ),
         "games": games,
     }
 
