@@ -15,11 +15,12 @@ from .crawler import LINK_ATTRIBUTES, QUARK_PATTERN, create_session, extract_qua
 from .database import DetailCandidate, DetailUpdate, ProviderResult, now_iso
 from .disk_links import (
     OTHER_PROVIDERS,
+    page_has_daily_quota,
     page_has_forbidden_marker,
     resolve_http_providers,
     resolve_other_providers,
 )
-from .errors import LoginStateExpired
+from .errors import DailyQuotaExceeded, LoginStateExpired
 from .login import page_requires_login
 
 
@@ -112,6 +113,8 @@ class DetailResolver:
             if http_result is not None and http_result.quark_url:
                 return http_result
             raise
+        except DailyQuotaExceeded:
+            raise
         except Exception as error:
             if http_result is not None and http_result.quark_url:
                 return http_result
@@ -172,6 +175,8 @@ class DetailResolver:
                 return result
             try:
                 return replace(result, provider_results=resolve_other_providers(request))
+            except DailyQuotaExceeded:
+                raise
             except Exception as error:
                 LOGGER.warning("其他网盘入口解析失败：%s", type(error).__name__)
                 return result
@@ -240,6 +245,10 @@ def resolve_browser_page(request: BrowserRequest) -> DetailResolution:
     button.click(timeout=timeout_ms)
     # 下载入口可能通过异步请求或新标签页返回地址，短暂等待其完成跳转。
     page.wait_for_timeout(2000)
+    new_pages = [item for item in page.context.pages if item not in pages_before]
+    # 额度页不是链接缺失或临时网络错误；必须在状态分类前让整批停止。
+    if page_has_daily_quota(page) or any(page_has_daily_quota(item) for item in new_pages):
+        raise DailyQuotaExceeded("今日游戏下载额度已用完；未增加当前游戏的失败次数")
     if page_requires_login(page) or new_page_requires_login(page, pages_before):
         return DetailResolution(None, "登录状态已失效", "login_expired", "点击入口后要求重新登录")
     quark_url = find_redirect_url(page, pages_before, request.candidates)

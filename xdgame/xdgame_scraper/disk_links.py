@@ -12,6 +12,7 @@ from urllib.parse import unquote, urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from .database import ProviderResult
+from .errors import DailyQuotaExceeded
 from .login import page_requires_login
 
 
@@ -151,6 +152,8 @@ def collect_provider_results(
     for provider in OTHER_PROVIDERS:
         try:
             result = resolve_provider(browser, provider, available)
+        except DailyQuotaExceeded:
+            raise
         except Exception as error:
             LOGGER.warning("%s 入口解析失败：%s", provider, type(error).__name__)
             result = ProviderResult(provider, None, "retry", "入口解析发生临时错误")
@@ -192,6 +195,9 @@ def click_provider(browser: ProviderBrowser, provider: str, button: Any) -> Prov
         button.click(timeout=timeout_ms)
         page.wait_for_timeout(2000)
         new_pages = [item for item in page.context.pages if item not in pages_before]
+        # 额度耗尽优先于地址提取，避免将站点限制误记为单个网盘的失败。
+        if page_has_daily_quota(page) or any(page_has_daily_quota(item) for item in new_pages):
+            raise DailyQuotaExceeded("今日游戏下载额度已用完；未增加当前游戏的失败次数")
         urls = browser.candidates + [page.url]
         urls.extend(item.url for item in new_pages)
         for item in [page, *new_pages]:
@@ -222,3 +228,7 @@ def page_has_forbidden_marker(page: Any) -> bool:
     body = page.locator("body")
     text = body.inner_text() if body.count() else ""
     return any(marker in text for marker in FORBIDDEN_MARKERS)
+
+
+def page_has_daily_quota(page: Any) -> bool:
+    return "今日游戏下载额度已用完" in page.title()

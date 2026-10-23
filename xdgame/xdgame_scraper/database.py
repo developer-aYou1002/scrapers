@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
-DATABASE_VERSION = 5
+DATABASE_VERSION = 6
 LOCK_STALE_SECONDS = 30 * 60
 DATABASE_MIGRATIONS = {
     1: (
@@ -84,6 +85,26 @@ DATABASE_MIGRATIONS = {
             last_error TEXT,
             checked_at TEXT NOT NULL,
             PRIMARY KEY (game_id, provider)
+        )
+        """,
+    ),
+    6: (
+        """
+        CREATE TABLE game_rankings (
+            ranking_type TEXT NOT NULL,
+            rank_position INTEGER NOT NULL,
+            detail_url TEXT NOT NULL,
+            heat INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (ranking_type, rank_position),
+            UNIQUE (ranking_type, detail_url)
+        )
+        """,
+        """
+        CREATE TABLE ranking_daily_visits (
+            visit_date TEXT NOT NULL,
+            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+            PRIMARY KEY (visit_date, game_id)
         )
         """,
     ),
@@ -352,6 +373,69 @@ def load_detail_candidates(
     query, parameters = detail_selection_query(selection)
     rows = connection.execute(query, parameters).fetchall()
     return [detail_candidate_from_row(row) for row in rows]
+
+
+def replace_rankings(connection: sqlite3.Connection, rows: list[tuple[int, str, int]]) -> None:
+    # 榜单快照独立于 games；只有完整解析后才在同一事务中替换旧快照。
+    timestamp = now_iso()
+    connection.execute("DELETE FROM game_rankings WHERE ranking_type = 'hot'")
+    connection.executemany(
+        """INSERT INTO game_rankings
+           (ranking_type, rank_position, detail_url, heat, fetched_at)
+           VALUES ('hot', ?, ?, ?, ?)""",
+        ((position, url, heat, timestamp) for position, url, heat in rows),
+    )
+
+
+def load_rank_candidates(
+    connection: sqlite3.Connection,
+    limit: int,
+    max_attempts: int,
+) -> list[DetailCandidate]:
+    rows = connection.execute(
+        """
+        SELECT g.id, g.name, g.detail_url, g.quark_url,
+               g.detail_status, g.detail_attempts
+        FROM game_rankings AS ranking
+        JOIN games AS g ON g.detail_url = ranking.detail_url
+        WHERE ranking.ranking_type = 'hot'
+          AND g.detail_status IN ('pending', 'retry', 'recheck_retry', 'login_expired')
+          AND g.detail_attempts < ?
+        ORDER BY ranking.rank_position ASC
+        LIMIT ?
+        """,
+        (max_attempts, limit),
+    ).fetchall()
+    return [detail_candidate_from_row(row) for row in rows]
+
+
+def ranking_counts(connection: sqlite3.Connection) -> tuple[int, int]:
+    row = connection.execute(
+        """SELECT count(*) AS total, count(g.id) AS matched
+           FROM game_rankings AS r LEFT JOIN games AS g ON g.detail_url = r.detail_url
+           WHERE r.ranking_type = 'hot'"""
+    ).fetchone()
+    return int(row["total"]), int(row["matched"])
+
+
+def rank_visit_date() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+
+def rank_daily_visit_count(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT count(*) FROM ranking_daily_visits WHERE visit_date = ?",
+        (rank_visit_date(),),
+    ).fetchone()
+    return int(row[0])
+
+
+def record_rank_visit(connection: sqlite3.Connection, game_id: int) -> None:
+    # 请求前预留当天名额；中断后仍按已访问计数，避免恢复时超额请求。
+    connection.execute(
+        "INSERT OR IGNORE INTO ranking_daily_visits (visit_date, game_id) VALUES (?, ?)",
+        (rank_visit_date(), game_id),
+    )
 
 
 def detail_selection_query(selection: DetailSelection) -> tuple[str, tuple[Any, ...]]:

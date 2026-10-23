@@ -24,9 +24,14 @@ from .database import (
     delete_checkpoint,
     finish_crawl_run,
     load_detail_candidates,
+    load_rank_candidates,
     load_checkpoint,
     now_iso,
     refresh_crawl_lock,
+    ranking_counts,
+    rank_daily_visit_count,
+    record_rank_visit,
+    replace_rankings,
     save_detail_result,
     save_provider_results,
     save_checkpoint,
@@ -46,7 +51,7 @@ from .detail_enricher import (
     build_detail_update,
     wait_between_candidates,
 )
-from .errors import LoginStateExpired, TaskInterrupted
+from .errors import DailyQuotaExceeded, LoginStateExpired, TaskInterrupted
 from .exporter import export_database
 from .list_crawler import (
     DEFAULT_LIST_URL,
@@ -56,6 +61,7 @@ from .list_crawler import (
 )
 from .login import save_login_state
 from .logging_setup import LoggingConfig, configure_logging
+from .ranking import fetch_hot_ranking
 
 
 DEFAULT_LOGIN_URL = "https://www.xdgame.com/user/"
@@ -76,6 +82,7 @@ DEFAULT_RECHECK_DAYS = 30
 DETAIL_TASK_KEY = "detail-enrichment"
 EXIT_FAILURE = 1
 EXIT_LOGIN_EXPIRED = 3
+EXIT_DAILY_QUOTA = 4
 EXIT_INTERRUPTED = 130
 LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +111,7 @@ class EnrichBatch:
     config: EnrichConfig
     lock_owner: str
     task_key: str
+    ranked: bool = False
 
 
 @dataclass
@@ -142,7 +150,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("today", "login", "full-list", "enrich", "daily", "export"),
+        choices=(
+            "today", "login", "full-list", "enrich", "daily", "export",
+            "rank-scan", "rank-enrich",
+        ),
         default="today",
     )
     add_list_arguments(parser)
@@ -197,6 +208,12 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_RECHECK_DAYS,
         help="已成功夸克地址的复查周期天数",
+    )
+    parser.add_argument(
+        "--daily-game-limit",
+        type=int,
+        default=40,
+        help="rank-enrich 每个北京时间自然日最多访问的不同游戏数，默认 40",
     )
 
 
@@ -293,8 +310,8 @@ def build_detail_selection(
         raise ValueError("batch-size 必须大于 0")
     if args.max_attempts <= 0:
         raise ValueError("max-attempts 必须大于 0")
-    if args.recheck_days <= 0:
-        raise ValueError("recheck-days 必须大于 0")
+    if args.recheck_days < 0:
+        raise ValueError("recheck-days 不能小于 0")
     return DetailSelection(
         args.batch_size,
         args.max_attempts,
@@ -440,6 +457,9 @@ def enrich_candidates(
                 len(batch.candidates),
                 candidate.name,
             )
+            if batch.ranked:
+                with connection:
+                    record_rank_visit(connection, candidate.id)
             resolution = resolver.resolve(candidate)
             update = build_detail_update(
                 candidate,
@@ -470,20 +490,43 @@ def enrich_candidates(
 
 
 def run_enrich(args: argparse.Namespace) -> EnrichProgress:
+    return run_detail_batch(args, ranked=False)
+
+
+def run_rank_enrich(args: argparse.Namespace) -> EnrichProgress:
+    return run_detail_batch(args, ranked=True)
+
+
+def run_detail_batch(args: argparse.Namespace, ranked: bool) -> EnrichProgress:
     config = build_enrich_config(args)
     selection = build_detail_selection(args)
+    if ranked and args.daily_game_limit <= 0:
+        raise ValueError("daily-game-limit 必须大于 0")
     with database_connection(args.database) as connection:
+        # 排名补全与普通补全共用详情锁，避免并发任务绕过当天访问额度。
         with crawl_task_lock(connection, DETAIL_TASK_KEY) as lock_owner:
-            candidates = load_detail_candidates(connection, selection)
+            if ranked:
+                total, _ = ranking_counts(connection)
+                if total == 0:
+                    raise RuntimeError("尚无人气榜快照，请先执行 rank-scan")
+                remaining = max(0, args.daily_game_limit - rank_daily_visit_count(connection))
+                candidates = load_rank_candidates(
+                    connection, min(selection.limit, remaining), selection.max_attempts
+                )
+                if remaining == 0:
+                    LOGGER.info("人气榜今日保守访问上限已达 %d 个游戏", args.daily_game_limit)
+            else:
+                candidates = load_detail_candidates(connection, selection)
             progress = EnrichProgress(selected=len(candidates))
             with connection:
-                run_id = start_crawl_run(connection, "enrich")
+                run_id = start_crawl_run(connection, "rank-enrich" if ranked else "enrich")
             try:
-                batch = EnrichBatch(candidates, config, lock_owner, DETAIL_TASK_KEY)
+                batch = EnrichBatch(candidates, config, lock_owner, DETAIL_TASK_KEY, ranked)
                 progress = enrich_candidates(connection, batch, progress)
-                progress.has_more = bool(
-                    load_detail_candidates(connection, replace(selection, limit=1))
-                )
+                if not ranked:
+                    progress.has_more = bool(
+                        load_detail_candidates(connection, replace(selection, limit=1))
+                    )
                 status = "success" if progress.errors == 0 else "completed_with_errors"
                 with connection:
                     finish_crawl_run(
@@ -495,11 +538,39 @@ def run_enrich(args: argparse.Namespace) -> EnrichProgress:
                 outcome = CrawlRunOutcome("incomplete", progress.processed, "用户中断详情补全")
                 record_run_outcome(connection, run_id, outcome)
                 raise TaskInterrupted("用户中断；已保留逐条提交的详情结果") from None
+            except DailyQuotaExceeded as error:
+                outcome = CrawlRunOutcome("quota_exceeded", progress.processed, str(error))
+                record_run_outcome(connection, run_id, outcome)
+                raise
             except Exception as error:
                 outcome = CrawlRunOutcome("failed", progress.processed, str(error)[:1000])
                 record_run_outcome(connection, run_id, outcome)
                 raise
     return progress
+
+
+def run_rank_scan(args: argparse.Namespace) -> tuple[int, int]:
+    if args.timeout <= 0:
+        raise ValueError("timeout 必须大于 0")
+    with database_connection(args.database) as connection:
+        with crawl_task_lock(connection, "ranking:hot") as owner:
+            with connection:
+                run_id = start_crawl_run(connection, "rank-scan")
+            try:
+                rows = fetch_hot_ranking(args.timeout)
+                with connection:
+                    replace_rankings(connection, rows)
+                    refresh_crawl_lock(connection, "ranking:hot", owner)
+                    finish_crawl_run(connection, run_id, CrawlRunOutcome("success", len(rows)))
+                return ranking_counts(connection)
+            except KeyboardInterrupt:
+                record_run_outcome(
+                    connection, run_id, CrawlRunOutcome("incomplete", 0, "用户中断人气榜扫描")
+                )
+                raise TaskInterrupted("用户中断；旧榜单快照未改变") from None
+            except Exception as error:
+                record_run_outcome(connection, run_id, CrawlRunOutcome("failed", 0, str(error)[:1000]))
+                raise
 
 
 def execute_daily(
@@ -581,6 +652,10 @@ def run_daily_locked(
         )
         record_run_outcome(connection, run_id, outcome)
         raise TaskInterrupted("用户中断；已保留逐页和逐条提交的结果") from None
+    except DailyQuotaExceeded as error:
+        outcome = CrawlRunOutcome("quota_exceeded", daily_processed_count(progress), str(error))
+        record_run_outcome(connection, run_id, outcome)
+        raise
     except Exception as error:
         outcome = CrawlRunOutcome(
             "failed",
@@ -619,6 +694,9 @@ def execute_safely(args: argparse.Namespace) -> int:
     except LoginStateExpired as error:
         LOGGER.error("登录状态已失效：%s；请执行 python scraper.py login 后重试", error)
         return EXIT_LOGIN_EXPIRED
+    except DailyQuotaExceeded as error:
+        LOGGER.error("下载额度已用完：%s；请等待网站额度恢复后继续", error)
+        return EXIT_DAILY_QUOTA
     except (TaskInterrupted, KeyboardInterrupt) as error:
         LOGGER.error("用户中断任务：%s", str(error) or "已停止")
         return EXIT_INTERRUPTED
@@ -639,6 +717,19 @@ def execute_command(args: argparse.Namespace) -> int:
         return execute_full_list_command(args)
     if args.command == "enrich":
         return execute_enrich_command(args)
+    if args.command == "rank-scan":
+        total, matched = run_rank_scan(args)
+        LOGGER.info("人气榜快照完成：共 %d 条，其中电脑游戏库匹配 %d 条", total, matched)
+        return 0
+    if args.command == "rank-enrich":
+        if args.batch_interval is not None:
+            raise ValueError("rank-enrich 只执行单批，不能使用 batch-interval")
+        progress = run_rank_enrich(args)
+        LOGGER.info(
+            "人气榜详情补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条",
+            progress.selected, progress.processed, progress.completed, progress.errors,
+        )
+        return 0
     if args.command == "daily":
         return execute_daily_command(args)
     if args.command == "export":

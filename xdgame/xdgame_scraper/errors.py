@@ -4,3 +4,7 @@ class LoginStateExpired(RuntimeError):
 
 class TaskInterrupted(RuntimeError):
     """用户主动中断，已完成的数据仍按既有事务边界保留。"""
+
+
+class DailyQuotaExceeded(RuntimeError):
+    """站点账号当天的新游戏下载额度已用完，详情任务必须立即停止。"""

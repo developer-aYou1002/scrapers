@@ -1,6 +1,8 @@
 # XDGAME 游戏抓取器
 
-抓取 XDGAME 首页“今日更新”或“电脑游戏”分类全量列表，将结果持久化到 SQLite，并支持分批补全及定期复查夸克网盘地址；今日更新模式还会保留 JSON 输出。
+抓取 XDGAME 首页“今日更新”或“电脑游戏”分类全量列表，将结果持久化到 SQLite，并支持分批补全及定期复查夸克和其他网盘地址；今日更新模式还会保留 JSON 输出。
+
+macOS 常用命令及作用见 [COMMANDS.md](COMMANDS.md)。
 
 ## 能力与限制
 
@@ -22,6 +24,7 @@
 - `xdgame_scraper/list_crawler.py`：电脑游戏列表页解析、分页识别和列表请求节流。
 - `xdgame_scraper/detail_enricher.py`：详情分批补全、浏览器回退、状态分类与请求节流。
 - `xdgame_scraper/daily.py`：日常列表扫描、新增识别和安全停止判断。
+- `xdgame_scraper/ranking.py`：人气榜前 100 名解析与完整性校验。
 - `xdgame_scraper/database.py`：SQLite 初始化、迁移、事务及数据访问。
 - `xdgame_scraper/exporter.py`：从 SQLite 只读加载并原子导出完整 JSON。
 - `xdgame_scraper/login.py`：登录表单填写、人工验证回退和登录状态保存。
@@ -146,9 +149,22 @@ python scraper.py full-list --list-url https://www.xdgame.com/list/1/ --delay-mi
 
 如果详情地址已经存在，列表 UPSERT 会保留已有详情和夸克解析结果，不会把已成功记录重置为待处理。当前第三阶段的 `full-list` 子命令只负责稳定完成全量列表入库，不会增加详情补全尝试次数。
 
-全量列表扫描和详情补全相互独立，避免数百页列表抓取与上万条详情访问绑定成一个无法恢复的长任务。列表入库完成或取得部分数据后，可按下一节分批补全详情。
+全量列表扫描和详情补全相互独立，避免数百页列表抓取与上万条详情访问绑定成一个无法恢复的长任务。列表入库完成或取得部分数据后，可按后续章节分批补全详情。
 
 同一数据库和列表入口同一时间只允许一个全量任务运行。任务锁每页刷新心跳，正常退出时自动释放；进程异常消失且超过30分钟没有心跳时，后续任务可以自动接管旧锁。
+
+### 人气榜优先补全（不影响全量列表）
+
+先扫描站点“天梯排名”的人气榜前 100 名，保存名次和热度快照；榜单包含非电脑游戏条目，只有能按详情 URL 匹配到 `full-list` 数据库的记录才进入补全队列：
+
+```bash
+.venv/bin/python scraper.py rank-scan
+.venv/bin/python scraper.py rank-enrich --batch-size 20
+```
+
+`rank-enrich` 每次只处理一批，严格按榜单名次选取尚未成功且未耗尽尝试次数的记录；已完成的游戏、旧版 `not_found` / `structure_changed` 和 `failed` 不会自动重试。再次运行 `rank-scan` 可刷新榜单快照；`full-list` 的断点、普通 `enrich` 的顺序及 `daily` 的新增优先级不变。榜单页目前只直接提供前 100 名，不能据此对全库游戏排序。
+
+为留出余量，`rank-enrich` 默认每个北京时间自然日最多访问 40 个不同游戏，可用 `--daily-game-limit` 调整；这个上限只统计 `rank-enrich` 自己访问的游戏，不知道账号在网页或其他命令中的用量。站点提示“今日游戏下载额度已用完”时，补全任务立即停止并返回退出码 `4`，当前游戏不增加失败次数；同样的止损也适用于普通 `enrich` 和 `daily`。站点额度何时恢复以页面提示为准。历史上已因额度耗尽标为 `failed` 的记录不会自动重置，需要先单独核实再处理。
 
 ### 详情和夸克地址分批补全
 
@@ -185,6 +201,7 @@ python scraper.py enrich --batch-size 20 --max-attempts 3 --delay-min 2 --delay-
 - `complete`：成功取得夸克地址。
 - `retry`：临时失败、页面未完整加载或入口点击后未能确认地址，后续批次继续尝试；累计 3 次后转为 `failed`。有限的响应状态、最终页面主机和标题等诊断信息保存在 `last_error`，不含 URL 查询参数。
 - `login_expired`：登录状态失效，当前批次立即停止并返回退出码 `3`；重新执行 `login` 后可继续。
+- 今日下载额度耗尽：当前批次立即停止并返回退出码 `4`；当前游戏不写入失败结果，已完成的逐条结果保留。
 - `forbidden`：页面明确提示无权限或需要会员。
 - `not_found`：确认正常详情页已加载下载区域及其他网盘入口，但未发现夸克网盘入口。
 - `structure_changed`：旧版本产生的结构异常状态；新抓取遇到结构不确定时改为可重试，不再新增此状态。
@@ -372,6 +389,7 @@ python scraper.py daily --log-file D:\XDGAME-Logs\xdgame.log
 - `1`：普通运行失败，或日常列表达到页数上限后仍未安全收敛。
 - `2`：命令行参数无效，由 `argparse` 返回。
 - `3`：登录状态失效；执行 `python scraper.py login` 重新登录后，再运行原命令。
+- `4`：网站今日游戏下载额度已用完；当前游戏不增加失败次数，等待额度恢复后再运行。
 - `130`：用户通过键盘中断任务。
 
 登录失效仅通过日志和退出码反馈，不发送 Windows 通知或 Webhook。Windows 计划任务会把任何非零退出码视为失败并按已配置策略重试；排查时应先按日志中的运行标识查找同一次执行的错误摘要。
@@ -380,12 +398,15 @@ python scraper.py daily --log-file D:\XDGAME-Logs\xdgame.log
 
 抓取时会自动初始化并更新 `data/xdgame.db`，不需要手动建库。数据库结构使用 `PRAGMA user_version` 管理版本，重复运行不会重复建表或清空已有数据。
 
-当前数据库结构版本为 4，包含以下数据：
+当前数据库结构版本为 6，包含以下数据：
 
 - `games`：游戏、详情地址、分类、列表元数据、夸克地址、解析状态、尝试次数、最后成功复查时间及发现时间。
 - `crawl_runs`：每次任务的开始、结束、状态、处理数量和错误摘要。
 - `crawl_checkpoints`：保存全量列表的分页断点位置。
 - `crawl_locks`：防止相同全量列表或详情补全任务并发写入，并支持超时接管异常遗留锁。
+- `game_disk_links`：其他网盘类型的解析结果。
+- `game_rankings`：最近一次完整解析的人气榜快照，不改变游戏原有入库顺序。
+- `ranking_daily_visits`：人气榜补全在北京时间当日访问过的游戏，用于保守额度限制。
 
 同一详情页地址会执行 UPSERT，不会重复插入。可以通过参数指定其他数据库路径：
 
@@ -428,7 +449,7 @@ with database_connection(path) as db:
 '@ | python -
 ```
 
-预期数据库版本为 `4`，并且下面的命令返回 `True`：
+预期数据库版本为 `6`，并且下面的命令返回 `True`：
 
 ```powershell
 Test-Path .\data\verify.db
@@ -516,8 +537,8 @@ db.close()
 
 预期结果：
 
-- 数据库版本为 `4`。
-- 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`、`crawl_locks`。
+- 数据库版本为 `6`。
+- 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`、`crawl_locks`、`game_disk_links`、`game_rankings`、`ranking_daily_visits`。
 - 游戏总数大于 `0`，并与唯一详情地址数相同。
 - 游戏记录包含分类、评分、容量和站点日期等列表元数据。
 - 新入库且尚未处理的游戏符合五项详情初始状态。
