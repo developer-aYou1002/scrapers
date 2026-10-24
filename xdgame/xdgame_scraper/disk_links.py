@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from .database import ProviderResult
 from .errors import DailyQuotaExceeded
 from .login import page_requires_login
+from .stage_trace import report_stage_result, trace_stage
 
 
 PROVIDER_HOSTS = {
@@ -46,13 +47,16 @@ def resolve_http_providers(session: Any, response: Any, config: Any) -> tuple[Pr
         return ()
     results: list[ProviderResult] = []
     for provider in PROVIDER_HOSTS:
+        stage = f"HTTP 下载接口：{provider}"
         button = region.select_one(f'a.downbtn[data-server="{provider}"]')
         if button is None:
             results.append(ProviderResult(provider, None, "not_found", "下载区域无对应网盘入口"))
+            report_stage_result(config, stage, "not_found")
             continue
         direct = extract_provider_url(str(button), provider)
         if direct:
             results.append(ProviderResult(provider, direct, "complete"))
+            report_stage_result(config, stage, "complete")
             continue
         endpoint = urljoin(response.url, str(button.get("data-url") or ""))
         parsed = urlsplit(endpoint)
@@ -62,21 +66,25 @@ def resolve_http_providers(session: Any, response: Any, config: Any) -> tuple[Pr
             or parsed.path != "/plus/download.php"
         ):
             results.append(ProviderResult(provider, None, "retry", "下载接口地址不符合预期"))
+            report_stage_result(config, stage, "retry")
             continue
         try:
             # 每个入口都对应一次站点请求，沿用用户配置的节流间隔。
-            time.sleep(random.uniform(config.delay_min, config.delay_max))
-            download = session.get(endpoint, allow_redirects=False, timeout=config.timeout)
-            target = download.headers.get("Location", "")
-            url = extract_provider_url(target, provider)
-            if not url and download.status_code == 200:
-                url = extract_provider_url(download.text, provider)
+            with trace_stage(config, stage):
+                time.sleep(random.uniform(config.delay_min, config.delay_max))
+                download = session.get(endpoint, allow_redirects=False, timeout=config.timeout)
+                target = download.headers.get("Location", "")
+                url = extract_provider_url(target, provider)
+                if not url and download.status_code == 200:
+                    url = extract_provider_url(download.text, provider)
             status = "complete" if url else "retry"
             error = None if url else f"下载接口未返回对应地址（HTTP {download.status_code}）"
             results.append(ProviderResult(provider, url, status, error))
+            report_stage_result(config, stage, status)
         except Exception as error:
             LOGGER.warning("%s 下载接口请求失败：%s", provider, type(error).__name__)
             results.append(ProviderResult(provider, None, "retry", "下载接口请求失败"))
+            report_stage_result(config, stage, "retry")
     return tuple(results)
 
 
@@ -100,20 +108,12 @@ def extract_provider_url(content: str, provider: str) -> str | None:
 
 
 def collect_provider_response(response: Any, candidates: list[str]) -> None:
+    # 响应事件中只检查 URL，不同步读取可能永不结束的 JSON 正文。
     for provider in OTHER_PROVIDERS:
         url = extract_provider_url(response.url, provider)
         if url:
             candidates.append(url)
             return
-    try:
-        if "json" in response.headers.get("content-type", ""):
-            body = response.text()
-            for provider in OTHER_PROVIDERS:
-                url = extract_provider_url(body, provider)
-                if url:
-                    candidates.append(url)
-    except Exception:
-        return
 
 
 def resolve_other_providers(request: Any) -> tuple[ProviderResult, ...]:
@@ -122,22 +122,23 @@ def resolve_other_providers(request: Any) -> tuple[ProviderResult, ...]:
     page.on("response", lambda response: collect_provider_response(response, candidates))
     timeout_ms = int(request.config.timeout * 1000)
     try:
-        response = page.goto(
-            request.candidate.detail_url,
-            wait_until="domcontentloaded",
-            timeout=timeout_ms,
-        )
-        if response is None or not 200 <= response.status < 300 or page_requires_login(page):
-            return ()
-        region = page.locator(".article-down").first
-        region.wait_for(state="visible", timeout=timeout_ms)
-        if region.locator("a.downbtn[data-server]").count() == 0:
-            return ()
-        available = frozenset(
-            provider
-            for provider in OTHER_PROVIDERS
-            if region.locator(f'a.downbtn[data-server="{provider}"]').count()
-        )
+        with trace_stage(request.config, "其他网盘页面"):
+            response = page.goto(
+                request.candidate.detail_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+            if response is None or not 200 <= response.status < 300 or page_requires_login(page):
+                return ()
+            region = page.locator(".article-down").first
+            region.wait_for(state="visible", timeout=timeout_ms)
+            if region.locator("a.downbtn[data-server]").count() == 0:
+                return ()
+            available = frozenset(
+                provider
+                for provider in OTHER_PROVIDERS
+                if region.locator(f'a.downbtn[data-server="{provider}"]').count()
+            )
         return collect_provider_results(ProviderBrowser(page, request, candidates), available)
     finally:
         if not page.is_closed():
@@ -151,13 +152,15 @@ def collect_provider_results(
     results: list[ProviderResult] = []
     for provider in OTHER_PROVIDERS:
         try:
-            result = resolve_provider(browser, provider, available)
+            with trace_stage(browser.request.config, f"网盘入口：{provider}"):
+                result = resolve_provider(browser, provider, available)
         except DailyQuotaExceeded:
             raise
         except Exception as error:
             LOGGER.warning("%s 入口解析失败：%s", provider, type(error).__name__)
             result = ProviderResult(provider, None, "retry", "入口解析发生临时错误")
         results.append(result)
+        report_stage_result(browser.request.config, f"网盘入口：{provider}", result.status)
     return tuple(results)
 
 

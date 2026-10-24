@@ -22,6 +22,7 @@ from .disk_links import (
 )
 from .errors import DailyQuotaExceeded, LoginStateExpired
 from .login import page_requires_login
+from .stage_trace import trace_stage
 
 
 DOWNLOAD_REGION = ".article-down"
@@ -38,6 +39,8 @@ class EnrichConfig:
     delay_min: float
     delay_max: float
     max_attempts: int
+    game_timeout: float = 180.0
+    stage_events: Any = None
 
 
 @dataclass(frozen=True)
@@ -131,8 +134,9 @@ class DetailResolver:
         candidate: DetailCandidate,
     ) -> tuple[DetailResolution | None, str | None]:
         try:
-            response = self.session.get(candidate.detail_url, timeout=self.config.timeout)
-            response.raise_for_status()
+            with trace_stage(self.config, "HTTP 详情"):
+                response = self.session.get(candidate.detail_url, timeout=self.config.timeout)
+                response.raise_for_status()
         except requests.RequestException as error:
             return None, f"HTTP 请求失败：{type(error).__name__}"
         expected = urlsplit(candidate.detail_url)
@@ -140,7 +144,8 @@ class DetailResolver:
         if (actual.hostname, actual.path) != (expected.hostname, expected.path):
             return None, "HTTP 详情页跳转到非目标页面"
         try:
-            provider_results = resolve_http_providers(self.session, response, self.config)
+            with trace_stage(self.config, "HTTP 下载接口"):
+                provider_results = resolve_http_providers(self.session, response, self.config)
         except Exception as error:
             LOGGER.warning("HTTP 网盘入口解析失败：%s", type(error).__name__)
             provider_results = ()
@@ -170,11 +175,13 @@ class DetailResolver:
         page.on("response", lambda response: collect_response_url(response, candidates))
         try:
             request = BrowserRequest(page, candidate, candidates, self.config)
-            result = resolve_browser_page(request)
+            with trace_stage(self.config, "浏览器详情"):
+                result = resolve_browser_page(request)
             if result.detail_status == "login_expired":
                 return result
             try:
-                return replace(result, provider_results=resolve_other_providers(request))
+                with trace_stage(self.config, "其他网盘解析"):
+                    return replace(result, provider_results=resolve_other_providers(request))
             except DailyQuotaExceeded:
                 raise
             except Exception as error:
@@ -206,11 +213,12 @@ class DetailResolver:
 def resolve_browser_page(request: BrowserRequest) -> DetailResolution:
     page = request.page
     timeout_ms = int(request.config.timeout * 1000)
-    response = page.goto(
-        request.candidate.detail_url,
-        wait_until="domcontentloaded",
-        timeout=timeout_ms,
-    )
+    with trace_stage(request.config, "浏览器详情导航"):
+        response = page.goto(
+            request.candidate.detail_url,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
     if page_requires_login(page):
         return DetailResolution(None, "登录状态已失效", "login_expired", "详情页要求重新登录")
     navigation_error = check_detail_navigation(page, response, request.candidate.detail_url)
@@ -242,9 +250,10 @@ def resolve_browser_page(request: BrowserRequest) -> DetailResolution:
         return DetailResolution(attribute_url, "已通过浏览器获取", "complete")
 
     pages_before = set(page.context.pages)
-    button.click(timeout=timeout_ms)
-    # 下载入口可能通过异步请求或新标签页返回地址，短暂等待其完成跳转。
-    page.wait_for_timeout(2000)
+    with trace_stage(request.config, "夸克入口"):
+        button.click(timeout=timeout_ms)
+        # 下载入口可能通过异步请求或新标签页返回地址，短暂等待其完成跳转。
+        page.wait_for_timeout(2000)
     new_pages = [item for item in page.context.pages if item not in pages_before]
     # 额度页不是链接缺失或临时网络错误；必须在状态分类前让整批停止。
     if page_has_daily_quota(page) or any(page_has_daily_quota(item) for item in new_pages):
@@ -334,17 +343,10 @@ def find_attribute_url(button: Any) -> str | None:
 
 
 def collect_response_url(response: Any, candidates: list[str]) -> None:
+    # 响应事件回调不能等待正文下载；单个异常响应可能阻塞整条游戏。
     match = QUARK_PATTERN.search(response.url)
     if match:
         candidates.append(match.group(0))
-        return
-    try:
-        if "json" in response.headers.get("content-type", ""):
-            match = QUARK_PATTERN.search(response.text())
-            if match:
-                candidates.append(match.group(0))
-    except Exception:
-        return
 
 
 def find_redirect_url(page: Any, pages_before: set[Any], candidates: list[str]) -> str | None:

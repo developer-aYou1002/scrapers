@@ -27,6 +27,7 @@ cd /Users/niko/Code/projects/git-projects/scrapers/xdgame
 | `.venv/bin/python scraper.py rank-scan` | 扫描并保存“人气排名”前 100 名的名次、热度和详情 URL；不点击下载入口。 |
 | `.venv/bin/python scraper.py rank-enrich --batch-size 20` | 从最近的人气榜快照中按名次补全一批尚未成功的电脑游戏；与 `full-list` 相互独立。 |
 | `.venv/bin/python scraper.py rank-enrich --batch-size 10 --daily-game-limit 40` | 缩小单批数量，并设置人气榜补全每个北京时间自然日访问不同游戏的上限。 |
+| `.venv/bin/python scraper.py rank-enrich --batch-size 1 --game-timeout 180` | 单条人工观察；每个游戏最多处理 180 秒，超时记为可重试并继续后续候选。 |
 | `.venv/bin/python scraper.py enrich` | 补全一批详情，默认最多 20 条，同时尝试夸克、百度、天翼、迅雷和移动网盘。 |
 | `.venv/bin/python scraper.py enrich --batch-size 10 --delay-min 3 --delay-max 6` | 单次小批补全，并将请求间隔设为随机 3～6 秒。适合人工观察结果；不保证避开网站每日额度。 |
 | `.venv/bin/python scraper.py enrich --batch-size 1 --show-browser` | 只处理一条候选记录并显示浏览器，便于人工观察入口行为；仍会消耗网站访问或下载额度。 |
@@ -39,7 +40,7 @@ cd /Users/niko/Code/projects/git-projects/scrapers/xdgame
 
 `enrich` 先处理可重试记录，再按数据库 `games.id` 从小到大处理普通 `pending`。该 ID 是入库顺序，并非网站游戏 ID 或固定页码。旧版产生的 `not_found`、`structure_changed`，以及已耗尽尝试次数的 `failed`，不会因再次运行 `enrich` 而自动重试；当前没有为它们提供安全的重入队命令。
 
-抓取命令默认使用 `data/xdgame.db`，日志写入 `logs/xdgame.log`，单次请求超时 20 秒。需要使用其他数据库时，在命令后加 `--database 路径`；需要改变请求超时时加 `--timeout 秒数`。不要把已有数据库误写到其他路径。
+抓取命令默认使用 `data/xdgame.db`，日志写入 `logs/xdgame.log`，单次请求超时 20 秒；详情补全的单游戏总时限为 180 秒。需要使用其他数据库时，在命令后加 `--database 路径`；需要改变请求超时时加 `--timeout 秒数`，改变详情总时限时加 `--game-timeout 秒数`。不要把已有数据库误写到其他路径。总时限超出后当前游戏按可重试失败计次，已完成条目保留；日志会指出最后一个未结束阶段。
 
 ### 连续补全命令：需留意每日下载额度
 

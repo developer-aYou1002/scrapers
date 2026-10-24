@@ -46,13 +46,13 @@ from .daily import (
     crawl_daily_list,
 )
 from .detail_enricher import (
-    DetailResolver,
     EnrichConfig,
     build_detail_update,
     wait_between_candidates,
 )
 from .errors import DailyQuotaExceeded, LoginStateExpired, TaskInterrupted
 from .exporter import export_database
+from .game_worker import resolve_game
 from .list_crawler import (
     DEFAULT_LIST_URL,
     FullListConfig,
@@ -215,6 +215,12 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
         default=40,
         help="rank-enrich 每个北京时间自然日最多访问的不同游戏数，默认 40",
     )
+    parser.add_argument(
+        "--game-timeout",
+        type=float,
+        default=180.0,
+        help="每条游戏详情处理的总时限秒数，默认 180",
+    )
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -286,6 +292,9 @@ def resolve_max_pages(value: int | None, default: int) -> int:
 def build_enrich_config(args: argparse.Namespace) -> EnrichConfig:
     if args.timeout <= 0:
         raise ValueError("timeout 必须大于 0")
+    game_timeout = getattr(args, "game_timeout", 180.0)
+    if game_timeout <= 0:
+        raise ValueError("game-timeout 必须大于 0")
     validate_delay_range(args)
     return EnrichConfig(
         timeout=args.timeout,
@@ -294,6 +303,7 @@ def build_enrich_config(args: argparse.Namespace) -> EnrichConfig:
         delay_min=args.delay_min,
         delay_max=args.delay_max,
         max_attempts=args.max_attempts,
+        game_timeout=game_timeout,
     )
 
 
@@ -449,43 +459,33 @@ def enrich_candidates(
     batch: EnrichBatch,
     progress: EnrichProgress,
 ) -> EnrichProgress:
-    with DetailResolver(batch.config) as resolver:
-        for index, candidate in enumerate(batch.candidates, start=1):
-            LOGGER.info(
-                "[%d/%d] 补全详情：%s",
-                index,
-                len(batch.candidates),
-                candidate.name,
-            )
-            if batch.ranked:
-                with connection:
-                    record_rank_visit(connection, candidate.id)
-            resolution = resolver.resolve(candidate)
-            update = build_detail_update(
-                candidate,
-                resolution,
-                batch.config.max_attempts,
-            )
+    for index, candidate in enumerate(batch.candidates, start=1):
+        LOGGER.info("[%d/%d] 补全详情：%s", index, len(batch.candidates), candidate.name)
+        if batch.ranked:
             with connection:
-                save_detail_result(connection, candidate.id, update)
-                save_provider_results(connection, candidate.id, resolution.provider_results)
-                refresh_crawl_lock(connection, batch.task_key, batch.lock_owner)
-            progress.processed += 1
-            if update.detail_status == "complete":
-                progress.completed += 1
-            else:
-                progress.errors += 1
-            LOGGER.info(
-                "详情状态：%s；夸克状态：%s；其他网盘成功：%d/%d；累计尝试：%d",
-                update.detail_status,
-                update.quark_status,
-                sum(item.url is not None for item in resolution.provider_results),
-                len(resolution.provider_results),
-                update.detail_attempts,
-            )
-            if update.detail_status == "login_expired":
-                raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行当前任务")
-            wait_between_candidates(batch.config, index, len(batch.candidates))
+                record_rank_visit(connection, candidate.id)
+        resolution = resolve_game(candidate, batch.config)
+        update = build_detail_update(candidate, resolution, batch.config.max_attempts)
+        with connection:
+            save_detail_result(connection, candidate.id, update)
+            save_provider_results(connection, candidate.id, resolution.provider_results)
+            refresh_crawl_lock(connection, batch.task_key, batch.lock_owner)
+        progress.processed += 1
+        if update.detail_status == "complete":
+            progress.completed += 1
+        else:
+            progress.errors += 1
+        LOGGER.info(
+            "详情状态：%s；夸克状态：%s；其他网盘成功：%d/%d；累计尝试：%d",
+            update.detail_status,
+            update.quark_status,
+            sum(item.url is not None for item in resolution.provider_results),
+            len(resolution.provider_results),
+            update.detail_attempts,
+        )
+        if update.detail_status == "login_expired":
+            raise LoginStateExpired("登录状态已失效，请先执行 login 后重新运行当前任务")
+        wait_between_candidates(batch.config, index, len(batch.candidates))
     return progress
 
 
