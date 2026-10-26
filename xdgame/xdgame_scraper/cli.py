@@ -15,6 +15,7 @@ import requests
 
 from .crawler import DEFAULT_URL, ScrapeConfig, create_session, scrape
 from .database import (
+    all_rankings_counts,
     CrawlCheckpoint,
     CrawlRunOutcome,
     DetailCandidate,
@@ -23,15 +24,18 @@ from .database import (
     database_connection,
     delete_checkpoint,
     finish_crawl_run,
+    load_all_rank_candidates,
     load_detail_candidates,
     load_rank_candidates,
     load_checkpoint,
     now_iso,
     refresh_crawl_lock,
     ranking_counts,
+    ranking_panel_types,
     rank_daily_visit_count,
     record_rank_visit,
     replace_rankings,
+    replace_ranking_panel,
     save_detail_result,
     save_provider_results,
     save_checkpoint,
@@ -61,7 +65,7 @@ from .list_crawler import (
 )
 from .login import save_login_state
 from .logging_setup import LoggingConfig, configure_logging
-from .ranking import fetch_hot_ranking
+from .ranking import RANKING_ORDER, fetch_all_rankings, fetch_hot_ranking
 
 
 DEFAULT_LOGIN_URL = "https://www.xdgame.com/user/"
@@ -152,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         choices=(
             "today", "login", "full-list", "enrich", "daily", "export",
-            "rank-scan", "rank-enrich",
+            "rank-scan", "rank-enrich", "rank-scan-all", "rank-enrich-all",
         ),
         default="today",
     )
@@ -213,7 +217,7 @@ def add_enrich_arguments(parser: argparse.ArgumentParser) -> None:
         "--daily-game-limit",
         type=int,
         default=40,
-        help="rank-enrich 每个北京时间自然日最多访问的不同游戏数，默认 40",
+        help="榜单补全每个北京时间自然日最多访问的不同游戏数，默认 40",
     )
     parser.add_argument(
         "--game-timeout",
@@ -497,7 +501,15 @@ def run_rank_enrich(args: argparse.Namespace) -> EnrichProgress:
     return run_detail_batch(args, ranked=True)
 
 
-def run_detail_batch(args: argparse.Namespace, ranked: bool) -> EnrichProgress:
+def run_rank_enrich_all(args: argparse.Namespace) -> EnrichProgress:
+    return run_detail_batch(args, ranked=True, all_rankings=True)
+
+
+def run_detail_batch(
+    args: argparse.Namespace,
+    ranked: bool,
+    all_rankings: bool = False,
+) -> EnrichProgress:
     config = build_enrich_config(args)
     selection = build_detail_selection(args)
     if ranked and args.daily_game_limit <= 0:
@@ -506,20 +518,23 @@ def run_detail_batch(args: argparse.Namespace, ranked: bool) -> EnrichProgress:
         # 排名补全与普通补全共用详情锁，避免并发任务绕过当天访问额度。
         with crawl_task_lock(connection, DETAIL_TASK_KEY) as lock_owner:
             if ranked:
-                total, _ = ranking_counts(connection)
-                if total == 0:
+                if all_rankings:
+                    missing = set(RANKING_ORDER) - ranking_panel_types(connection)
+                    if missing:
+                        raise RuntimeError("榜单快照不完整，请先执行 rank-scan-all")
+                elif ranking_counts(connection)[0] == 0:
                     raise RuntimeError("尚无人气榜快照，请先执行 rank-scan")
                 remaining = max(0, args.daily_game_limit - rank_daily_visit_count(connection))
-                candidates = load_rank_candidates(
-                    connection, min(selection.limit, remaining), selection.max_attempts
-                )
+                loader = load_all_rank_candidates if all_rankings else load_rank_candidates
+                candidates = loader(connection, min(selection.limit, remaining), selection.max_attempts)
                 if remaining == 0:
-                    LOGGER.info("人气榜今日保守访问上限已达 %d 个游戏", args.daily_game_limit)
+                    LOGGER.info("榜单今日保守访问上限已达 %d 个游戏", args.daily_game_limit)
             else:
                 candidates = load_detail_candidates(connection, selection)
             progress = EnrichProgress(selected=len(candidates))
             with connection:
-                run_id = start_crawl_run(connection, "rank-enrich" if ranked else "enrich")
+                run_type = "rank-enrich-all" if all_rankings else "rank-enrich" if ranked else "enrich"
+                run_id = start_crawl_run(connection, run_type)
             try:
                 batch = EnrichBatch(candidates, config, lock_owner, DETAIL_TASK_KEY, ranked)
                 progress = enrich_candidates(connection, batch, progress)
@@ -566,6 +581,34 @@ def run_rank_scan(args: argparse.Namespace) -> tuple[int, int]:
             except KeyboardInterrupt:
                 record_run_outcome(
                     connection, run_id, CrawlRunOutcome("incomplete", 0, "用户中断人气榜扫描")
+                )
+                raise TaskInterrupted("用户中断；旧榜单快照未改变") from None
+            except Exception as error:
+                record_run_outcome(connection, run_id, CrawlRunOutcome("failed", 0, str(error)[:1000]))
+                raise
+
+
+def run_rank_scan_all(args: argparse.Namespace) -> tuple[int, int]:
+    if args.timeout <= 0:
+        raise ValueError("timeout 必须大于 0")
+    with database_connection(args.database) as connection:
+        # 与旧人气榜扫描使用同一把锁，避免两个命令并发替换 hot 面板。
+        with crawl_task_lock(connection, "ranking:hot") as owner:
+            with connection:
+                run_id = start_crawl_run(connection, "rank-scan-all")
+            try:
+                panels = fetch_all_rankings(args.timeout)
+                with connection:
+                    for ranking_type in RANKING_ORDER:
+                        replace_ranking_panel(connection, ranking_type, panels[ranking_type])
+                    refresh_crawl_lock(connection, "ranking:hot", owner)
+                    finish_crawl_run(
+                        connection, run_id, CrawlRunOutcome("success", sum(map(len, panels.values())))
+                    )
+                return all_rankings_counts(connection)
+            except KeyboardInterrupt:
+                record_run_outcome(
+                    connection, run_id, CrawlRunOutcome("incomplete", 0, "用户中断榜单扫描")
                 )
                 raise TaskInterrupted("用户中断；旧榜单快照未改变") from None
             except Exception as error:
@@ -721,12 +764,25 @@ def execute_command(args: argparse.Namespace) -> int:
         total, matched = run_rank_scan(args)
         LOGGER.info("人气榜快照完成：共 %d 条，其中电脑游戏库匹配 %d 条", total, matched)
         return 0
+    if args.command == "rank-scan-all":
+        total, matched = run_rank_scan_all(args)
+        LOGGER.info("全部榜单快照完成：共 %d 条榜单记录，匹配 %d 个不同的电脑游戏", total, matched)
+        return 0
     if args.command == "rank-enrich":
         if args.batch_interval is not None:
             raise ValueError("rank-enrich 只执行单批，不能使用 batch-interval")
         progress = run_rank_enrich(args)
         LOGGER.info(
             "人气榜详情补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条",
+            progress.selected, progress.processed, progress.completed, progress.errors,
+        )
+        return 0
+    if args.command == "rank-enrich-all":
+        if args.batch_interval is not None:
+            raise ValueError("rank-enrich-all 只执行单批，不能使用 batch-interval")
+        progress = run_rank_enrich_all(args)
+        LOGGER.info(
+            "全部榜单去重补全完成：选取 %d 条，处理 %d 条，成功 %d 条，其他状态 %d 条",
             progress.selected, progress.processed, progress.completed, progress.errors,
         )
         return 0

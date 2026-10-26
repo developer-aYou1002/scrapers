@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-DATABASE_VERSION = 6
+DATABASE_VERSION = 7
 LOCK_STALE_SECONDS = 30 * 60
 DATABASE_MIGRATIONS = {
     1: (
@@ -107,6 +107,9 @@ DATABASE_MIGRATIONS = {
             PRIMARY KEY (visit_date, game_id)
         )
         """,
+    ),
+    7: (
+        "ALTER TABLE game_rankings ADD COLUMN metric_text TEXT",
     ),
 }
 
@@ -376,14 +379,27 @@ def load_detail_candidates(
 
 
 def replace_rankings(connection: sqlite3.Connection, rows: list[tuple[int, str, int]]) -> None:
-    # 榜单快照独立于 games；只有完整解析后才在同一事务中替换旧快照。
+    replace_ranking_panel(
+        connection,
+        "hot",
+        [(position, url, heat, f"{heat:,} 热度") for position, url, heat in rows],
+    )
+
+
+def replace_ranking_panel(
+    connection: sqlite3.Connection,
+    ranking_type: str,
+    rows: list[tuple[int, str, int, str]],
+) -> None:
+    # 面板快照独立于 games，调用方在完整解析全部目标面板后开启事务替换。
     timestamp = now_iso()
-    connection.execute("DELETE FROM game_rankings WHERE ranking_type = 'hot'")
+    connection.execute("DELETE FROM game_rankings WHERE ranking_type = ?", (ranking_type,))
     connection.executemany(
         """INSERT INTO game_rankings
-           (ranking_type, rank_position, detail_url, heat, fetched_at)
-           VALUES ('hot', ?, ?, ?, ?)""",
-        ((position, url, heat, timestamp) for position, url, heat in rows),
+           (ranking_type, rank_position, detail_url, heat, fetched_at, metric_text)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ((ranking_type, position, url, heat, timestamp, metric)
+         for position, url, heat, metric in rows),
     )
 
 
@@ -409,6 +425,49 @@ def load_rank_candidates(
     return [detail_candidate_from_row(row) for row in rows]
 
 
+def load_all_rank_candidates(
+    connection: sqlite3.Connection,
+    limit: int,
+    max_attempts: int,
+) -> list[DetailCandidate]:
+    # 同一游戏只取优先级最高的榜单名次；当日已经访问过的游戏不重复请求。
+    rows = connection.execute(
+        """
+        WITH ranked AS (
+            SELECT g.id, g.name, g.detail_url, g.quark_url,
+                   g.detail_status, g.detail_attempts,
+                   CASE r.ranking_type
+                       WHEN 'hot' THEN 0 WHEN 'month' THEN 1 WHEN 'quarter' THEN 2
+                       WHEN 'year' THEN 3 WHEN 'good' THEN 4 WHEN 'rank' THEN 5
+                       WHEN 'size' THEN 6 END AS board_order,
+                   r.rank_position,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY g.id ORDER BY
+                       CASE r.ranking_type
+                           WHEN 'hot' THEN 0 WHEN 'month' THEN 1 WHEN 'quarter' THEN 2
+                           WHEN 'year' THEN 3 WHEN 'good' THEN 4 WHEN 'rank' THEN 5
+                           WHEN 'size' THEN 6 END,
+                       r.rank_position
+                   ) AS occurrence
+            FROM game_rankings AS r
+            JOIN games AS g ON g.detail_url = r.detail_url
+            WHERE g.detail_status IN ('pending', 'retry', 'recheck_retry', 'login_expired')
+              AND g.detail_attempts < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM ranking_daily_visits AS visits
+                  WHERE visits.game_id = g.id AND visits.visit_date = ?
+              )
+        )
+        SELECT id, name, detail_url, quark_url, detail_status, detail_attempts
+        FROM ranked WHERE occurrence = 1
+        ORDER BY board_order, rank_position
+        LIMIT ?
+        """,
+        (max_attempts, rank_visit_date(), limit),
+    ).fetchall()
+    return [detail_candidate_from_row(row) for row in rows]
+
+
 def ranking_counts(connection: sqlite3.Connection) -> tuple[int, int]:
     row = connection.execute(
         """SELECT count(*) AS total, count(g.id) AS matched
@@ -416,6 +475,21 @@ def ranking_counts(connection: sqlite3.Connection) -> tuple[int, int]:
            WHERE r.ranking_type = 'hot'"""
     ).fetchone()
     return int(row["total"]), int(row["matched"])
+
+
+def all_rankings_counts(connection: sqlite3.Connection) -> tuple[int, int]:
+    row = connection.execute(
+        """SELECT count(*) AS total, count(DISTINCT g.id) AS matched
+           FROM game_rankings AS r LEFT JOIN games AS g ON g.detail_url = r.detail_url"""
+    ).fetchone()
+    return int(row["total"]), int(row["matched"])
+
+
+def ranking_panel_types(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute(
+        "SELECT ranking_type FROM game_rankings GROUP BY ranking_type HAVING count(*) = 100"
+    ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def rank_visit_date() -> str:

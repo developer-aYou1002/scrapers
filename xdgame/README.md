@@ -166,7 +166,16 @@ python scraper.py full-list --list-url https://www.xdgame.com/list/1/ --delay-mi
 
 `rank-enrich` 每次只处理一批，严格按榜单名次选取尚未成功且未耗尽尝试次数的记录；已完成的游戏、旧版 `not_found` / `structure_changed` 和 `failed` 不会自动重试。再次运行 `rank-scan` 可刷新榜单快照；`full-list` 的断点、普通 `enrich` 的顺序及 `daily` 的新增优先级不变。榜单页目前只直接提供前 100 名，不能据此对全库游戏排序。
 
-为留出余量，`rank-enrich` 默认每个北京时间自然日最多访问 40 个不同游戏，可用 `--daily-game-limit` 调整；这个上限只统计 `rank-enrich` 自己访问的游戏，不知道账号在网页或其他命令中的用量。站点提示“今日游戏下载额度已用完”时，补全任务立即停止并返回退出码 `4`，当前游戏不增加失败次数；同样的止损也适用于普通 `enrich` 和 `daily`。站点额度何时恢复以页面提示为准。历史上已因额度耗尽标为 `failed` 的记录不会自动重置，需要先单独核实再处理。
+需要覆盖其他榜单时，使用独立的全榜单命令：
+
+```bash
+.venv/bin/python scraper.py rank-scan-all
+.venv/bin/python scraper.py rank-enrich-all --batch-size 20
+```
+
+`rank-scan-all` 一次读取人气、月度、季度、年度、点赞、评分、容量这 7 个榜单，各保存前 100 名；“最近更新”不是排名，不包含在内。`rank-enrich-all` 按上述顺序及榜内名次补全，每批最多 20 个不同电脑游戏：同一游戏跨榜单只选一次，已 `complete` 的不再请求，当天经榜单命令访问过的也不重复访问。旧版终态 `failed`、`not_found` 和 `structure_changed` 仍不会自动重试；可重试状态留待下一天继续。两个新命令不会改变原有 `rank-scan`／`rank-enrich`、`full-list` 的行为。
+
+为留出余量，榜单补全命令合计默认每个北京时间自然日最多访问 40 个不同游戏，可用 `--daily-game-limit` 调整；这个上限只统计榜单命令自己访问的游戏，不知道账号在网页或其他命令中的用量。站点提示“今日游戏下载额度已用完”时，补全任务立即停止并返回退出码 `4`，当前游戏不增加失败次数；同样的止损也适用于普通 `enrich` 和 `daily`。站点额度何时恢复以页面提示为准。历史上已因额度耗尽标为 `failed` 的记录不会自动重置，需要先单独核实再处理。
 
 ### 详情和夸克地址分批补全
 
@@ -404,15 +413,15 @@ python scraper.py daily --log-file D:\XDGAME-Logs\xdgame.log
 
 抓取时会自动初始化并更新 `data/xdgame.db`，不需要手动建库。数据库结构使用 `PRAGMA user_version` 管理版本，重复运行不会重复建表或清空已有数据。
 
-当前数据库结构版本为 6，包含以下数据：
+当前数据库结构版本为 7，包含以下数据：
 
 - `games`：游戏、详情地址、分类、列表元数据、夸克地址、解析状态、尝试次数、最后成功复查时间及发现时间。
 - `crawl_runs`：每次任务的开始、结束、状态、处理数量和错误摘要。
 - `crawl_checkpoints`：保存全量列表的分页断点位置。
 - `crawl_locks`：防止相同全量列表或详情补全任务并发写入，并支持超时接管异常遗留锁。
 - `game_disk_links`：其他网盘类型的解析结果。
-- `game_rankings`：最近一次完整解析的人气榜快照，不改变游戏原有入库顺序。
-- `ranking_daily_visits`：人气榜补全在北京时间当日访问过的游戏，用于保守额度限制。
+- `game_rankings`：各榜单最近一次完整解析的名次、指标文字及详情 URL，不改变游戏原有入库顺序。
+- `ranking_daily_visits`：榜单补全在北京时间当日访问过的游戏，用于去重和保守额度限制。
 
 同一详情页地址会执行 UPSERT，不会重复插入。可以通过参数指定其他数据库路径：
 
@@ -455,7 +464,7 @@ with database_connection(path) as db:
 '@ | python -
 ```
 
-预期数据库版本为 `6`，并且下面的命令返回 `True`：
+预期数据库版本为 `7`，并且下面的命令返回 `True`：
 
 ```powershell
 Test-Path .\data\verify.db
@@ -543,7 +552,7 @@ db.close()
 
 预期结果：
 
-- 数据库版本为 `6`。
+- 数据库版本为 `7`。
 - 数据表包含 `games`、`crawl_checkpoints`、`crawl_runs`、`crawl_locks`、`game_disk_links`、`game_rankings`、`ranking_daily_visits`。
 - 游戏总数大于 `0`，并与唯一详情地址数相同。
 - 游戏记录包含分类、评分、容量和站点日期等列表元数据。

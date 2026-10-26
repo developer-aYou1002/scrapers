@@ -25,7 +25,10 @@ cd /Users/niko/Code/projects/git-projects/scrapers/xdgame
 | `.venv/bin/python scraper.py full-list --max-pages 2` | 限制本次最多扫描 2 页，用于小范围检查；若列表尚未结束，命令可能返回非零退出码。 |
 | `.venv/bin/python scraper.py full-list --restart` | 忽略已完成的列表断点，从第一页重新检查。仅在确实需要重扫时使用。 |
 | `.venv/bin/python scraper.py rank-scan` | 扫描并保存“人气排名”前 100 名的名次、热度和详情 URL；不点击下载入口。 |
+| `.venv/bin/python scraper.py rank-scan-all` | 一次扫描人气、月度、季度、年度、点赞、评分、容量 7 个榜单，各保存前 100 名；不点击下载入口。 |
 | `.venv/bin/python scraper.py rank-enrich --batch-size 20` | 从最近的人气榜快照中按名次补全一批尚未成功的电脑游戏；与 `full-list` 相互独立。 |
+| `.venv/bin/python scraper.py rank-enrich-all --batch-size 20` | 按七榜单优先级补全一批不同的电脑游戏；跨榜单、已完成及当日已访问游戏会跳过。重复运行可处理后续批次。 |
+| `.venv/bin/python scraper.py rank-scan-all && .venv/bin/python scraper.py rank-enrich-all --batch-size 40` | 一条终端命令先更新七个榜单快照，扫描成功后再去重补全；本次最多处理 40 个游戏，并受榜单补全的每日额度限制。 |
 | `.venv/bin/python scraper.py rank-enrich --batch-size 10 --daily-game-limit 40` | 缩小单批数量，并设置人气榜补全每个北京时间自然日访问不同游戏的上限。 |
 | `.venv/bin/python scraper.py rank-enrich --batch-size 1 --game-timeout 180` | 单条人工观察；每个游戏最多处理 180 秒，超时记为可重试并继续后续候选。 |
 | `.venv/bin/python scraper.py enrich` | 补全一批详情，默认最多 20 条，同时尝试夸克、百度、天翼、迅雷和移动网盘。 |
@@ -48,7 +51,7 @@ cd /Users/niko/Code/projects/git-projects/scrapers/xdgame
 .venv/bin/python scraper.py enrich --batch-size 50 --batch-interval 120
 ```
 
-这条命令每批最多 50 条，批次之间暂停 120 秒，直到无候选记录。但暂停时间**不会重置网站的每日下载额度**。2026-10-23 实际检查发现，当前登录账号的下载入口提示“每日额度 50 个游戏”；同一游戏切换网盘不重复计数。程序现会在识别到“今日游戏下载额度已用完”页面时立即停止，退出码为 `4`，且不增加当前游戏的失败次数。识别依赖站点页面文案，若网站改版仍需人工观察；`--daily-game-limit` 仅限制 `rank-enrich`，不限制此连续命令。
+这条命令每批最多 50 条，批次之间暂停 120 秒，直到无候选记录。但暂停时间**不会重置网站的每日下载额度**。2026-10-23 实际检查发现，当前登录账号的下载入口提示“每日额度 50 个游戏”；同一游戏切换网盘不重复计数。程序现会在识别到“今日游戏下载额度已用完”页面时立即停止，退出码为 `4`，且不增加当前游戏的失败次数。识别依赖站点页面文案，若网站改版仍需人工观察；`--daily-game-limit` 仅限制 `rank-enrich`／`rank-enrich-all`，不限制此连续命令。
 
 ## 查看进度（只读）
 
@@ -81,4 +84,4 @@ sqlite3 -header -column 'file:data/xdgame.db?mode=ro' \
 - `login_state.json`、`data/xdgame.db` 和导出的 JSON 可能含 Cookie 或有效分享地址，不要提交到 Git 或上传在线数据库查看器。
 - 同一数据库同一时间不要启动两个详情补全任务。运行中的任务可在其终端按 `Ctrl+C` 中断；已逐条写入的结果会保留。
 - 图形化查看数据库可使用 DB Browser for SQLite 的只读打开方式；查看与抓取同时进行时不要编辑数据库。
-- `--batch-interval` 仅适用于 `enrich`，不是“每日最多抓取 50 个游戏”的限制参数；`rank-enrich` 是独立的单批命令。
+- `--batch-interval` 仅适用于 `enrich`，不是“每日最多抓取 50 个游戏”的限制参数；榜单补全命令每次只处理一批。
